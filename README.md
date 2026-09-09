@@ -27,7 +27,7 @@ Apple silicon Mac, macOS 14 or later. For each lane you want: Claude Code signed
 
 ## Install
 
-Unzip, move to Applications, open. Until the notarized build ships, macOS blocks the first open: on macOS 15 or later, open the app once, then go to System Settings → Privacy & Security and click Open Anyway. On macOS 14, right-click the app and choose Open. Then click Set up in the panel: it finds your coding tools, hides the ones you don't have, and collects the first reading. No terminal. Details in [INSTALL.md](INSTALL.md).
+Unzip, move to Applications, open. The app is signed with a Developer ID and notarized by Apple, so macOS opens it without a warning. Then click Set up in the panel: it finds your coding tools, hides the ones you don't have, and collects the first reading. No terminal. Details in [INSTALL.md](INSTALL.md).
 
 ## FAQ
 
