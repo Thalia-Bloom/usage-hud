@@ -4,7 +4,7 @@
 
 **One menu-bar meter for every AI subscription you code with.** Codex, Claude, Gemini, Grok and local models. See how much of each 5-hour and weekly window is used, when it resets, and whether the number can be trusted.
 
-**[Buy for $9](https://usage-hud-store.pattern-service.workers.dev)** · launch price through Sep 30, then $15 · one-time · personal license · updates through 1.x · 14-day refund by email
+**[Buy for $9](https://usage-hud-store.pattern-service.workers.dev)** · [hud.thaliabloom.com](https://hud.thaliabloom.com/) · launch price through Sep 30, then $15 · one-time · personal license · updates through 1.x · 14-day refund by email
 
 <p align="center"><img src="media/demo.gif" width="640" alt="Usage HUD demo"></p>
 
