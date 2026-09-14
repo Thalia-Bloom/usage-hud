@@ -31,6 +31,10 @@ Unzip, move to Applications, open. The app is signed with a Developer ID and not
 
 ## FAQ
 
+**Why did my weekly usage jump?** The weekly cap is separate from the 5-hour window and can move from other Claude clients on the same plan. [Why weekly usage jumped](https://hud.thaliabloom.com/why-weekly-usage-jumped/).
+**ccusage stopped tracking Claude?** ccusage reads local logs. Usage HUD reads the same usage endpoint Claude Code's `/usage` panel reads. [When ccusage stops tracking Claude](https://hud.thaliabloom.com/ccusage-stopped-tracking-claude/).
+**Where do I buy?** [hud.thaliabloom.com](https://hud.thaliabloom.com/). $9 launch price through Sep 30, then $15.
+**Is there a free alternative?** [CodexBar](https://github.com/steipete/CodexBar) is free and covers more providers. If it already does the job, you do not need this.
 **Is the source available?** Not yet. This repository is the product page and the install guide.
 **Refunds?** Email support@thaliabloom.com within 14 days.
 **License?** Personal. Use it on the Macs you own.
