@@ -23,7 +23,7 @@
 
 ## Requirements
 
-Apple silicon Mac, macOS 14 or later. For each lane you want: Claude Code signed in, Codex CLI, Gemini CLI, or Ollama. Node.js for the Codex, Gemini and Grok lanes; Python 3 for the Claude lane.
+Apple silicon Mac, macOS 14 or later, and Node.js 18 or later. For each lane you want: Claude Code signed in (plus Python 3, which the Xcode Command Line Tools include), Codex CLI, Antigravity CLI (agy) for Gemini, Grok CLI, or Ollama. Set up checks all of this and names anything missing.
 
 ## Install
 
