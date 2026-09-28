@@ -4,7 +4,7 @@
 
 **One menu-bar meter for every AI subscription you code with.** Codex, Claude, Gemini, Grok and local models. See how much of each 5-hour and weekly window is used, when it resets, and whether the number can be trusted.
 
-**[Buy for $9](https://usage-hud-store.pattern-service.workers.dev)** · [hud.thaliabloom.com](https://hud.thaliabloom.com/) · launch price through Sep 30, then $15 · one-time · personal license · updates through 1.x · 14-day refund by email
+**[Buy for $9](https://hud.thaliabloom.com/?utm_source=github&utm_campaign=mk-006)** · one-time · personal license · updates through 1.x · 14-day refund by email
 
 <p align="center"><img src="media/demo.gif" width="640" alt="Usage HUD demo"></p>
 
@@ -33,10 +33,10 @@ Unzip, move to Applications, open. The app is signed with a Developer ID and not
 
 **Why did my weekly usage jump?** The weekly cap is separate from the 5-hour window and can move from other Claude clients on the same plan. [Why weekly usage jumped](https://hud.thaliabloom.com/why-weekly-usage-jumped/).
 **ccusage stopped tracking Claude?** ccusage reads local logs. Usage HUD reads the same usage endpoint Claude Code's `/usage` panel reads. [When ccusage stops tracking Claude](https://hud.thaliabloom.com/ccusage-stopped-tracking-claude/).
-**Where do I buy?** [hud.thaliabloom.com](https://hud.thaliabloom.com/). $9 launch price through Sep 30, then $15.
+**Where do I buy?** [hud.thaliabloom.com](https://hud.thaliabloom.com/). $9, one time, 14-day refund. Want to check your numbers first? [claude-usage-check](https://github.com/Thalia-Bloom/claude-usage-check) is free and MIT.
 **Is there a free alternative?** [CodexBar](https://github.com/steipete/CodexBar) is free and covers more providers. If it already does the job, you do not need this.
 **Is the source available?** Not yet. This repository is the product page and the install guide.
 **Refunds?** Email support@thaliabloom.com within 14 days.
 **License?** Personal. Use it on the Macs you own.
 
-Bloom Web Services LLC · support@thaliabloom.com
+Bloom Web Services · 30 N Gould St, Ste N, Sheridan, WY 82801 · support@thaliabloom.com
