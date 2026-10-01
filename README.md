@@ -1,42 +1,52 @@
-<p align="center"><img src="media/panel-dark.png" width="420" alt="Usage HUD panel: one bar per provider with reset times and confidence labels"></p>
+<p align="center"><img src="media/panel-hot.png" width="420" alt="Usage HUD panel: WATCH, Claude running hot, Codex has room, one bar per subscription with reset times"></p>
 
 # Usage HUD
 
-**One menu-bar meter for every AI subscription you code with.** Codex, Claude, Gemini, Grok and local models. See how much of each 5-hour and weekly window is used, when it resets, and whether the number can be trusted.
+**Which AI subscription has room right now?** Usage HUD answers that in your Mac menu bar. One verdict for Claude, Codex, Gemini, Grok and local models: who is running hot, when it runs out at this pace, and which tool you can switch to.
 
-**[Buy for $9](https://hud.thaliabloom.com/?utm_source=github&utm_campaign=mk-006)** · one-time · personal license · updates through 1.x · 14-day refund by email
+**[Download for Mac (free)](https://github.com/Thalia-Bloom/usage-hud/releases/latest/download/UsageHUD.zip)** · Apple silicon · macOS 14+ · signed and notarized by Apple
 
-<p align="center"><img src="media/demo.gif" width="640" alt="Usage HUD demo"></p>
+Free. If it saves you a stalled afternoon, you can [leave a tip](https://hud.thaliabloom.com/#tip).
 
 ## What you see
 
-- One bar per provider, the reset time, and a freshness stamp. Turn a provider off without deleting its history.
-- A confidence label on every number: official, high, medium, or manual, with a one-line reason.
-- Local models: exact token counts from your Ollama logs, today and the rolling seven days.
+- **One verdict.** "Claude: running hot" with the next move under it: "Codex has room · 22% used".
+- **Pace, not just percent.** A tick on each bar marks how much of the window has passed. Ahead of it, the lane says when it runs dry: "this pace → empty ~4:31 PM".
+- **Reset times on every lane,** and a bell that pings you when a window comes back.
+- **An honest label on every number:** official, measured or estimated. Old readings say how old they are instead of passing as live.
+- **Local models count too:** token totals from your Ollama logs, today and this week.
 
 ## Built on trust
 
-- Everything is collected on your Mac. Nothing is sent to us. There is no account and no telemetry.
-- Claude numbers come from the same usage endpoint Claude Code's own `/usage` panel reads. The HUD never refreshes or changes your Claude Code token.
-- Codex numbers come from your local Codex session logs, labeled as local telemetry, not billing.
+- Everything stays on your Mac. No account, no analytics, no browser cookies.
+- Claude numbers come from the same usage endpoint Claude Code's own `/usage` panel reads. Usage HUD never refreshes or changes your Claude Code sign-in.
+- Codex numbers come from Codex's own quota and your local session logs.
 - `codex-usage-doctor` tells you in plain English whether each number is reliable and why.
-
-## Requirements
-
-Apple silicon Mac, macOS 14 or later, and Node.js 18 or later. For each lane you want: Claude Code signed in (plus Python 3, which the Xcode Command Line Tools include), Codex CLI, Antigravity CLI (agy) for Gemini, Grok CLI, or Ollama. Set up checks all of this and names anything missing.
 
 ## Install
 
-Unzip, move to Applications, open. The app is signed with a Developer ID and notarized by Apple, so macOS opens it without a warning. Then click Set up in the panel: it finds your coding tools, hides the ones you don't have, and collects the first reading. No terminal. Details in [INSTALL.md](INSTALL.md).
+1. [Download](https://github.com/Thalia-Bloom/usage-hud/releases/latest/download/UsageHUD.zip), unzip, and move **Usage HUD** to Applications.
+2. Open it. It lives in the menu bar (no Dock icon).
+3. Click **Set up**. It finds your coding tools, hides the ones you don't have, and takes the first reading in about 10 seconds. No terminal.
+
+Details and troubleshooting: [INSTALL.md](INSTALL.md).
+
+## Requirements
+
+- Apple silicon Mac, macOS 14 or later.
+- Claude Code or Codex signed in on this Mac. Nothing else to install for those two.
+- Gemini (Antigravity CLI) and Grok lanes need Node.js 18 or later.
+- The Local lane reads Ollama's logs.
+
+## Usage HUD or CodexBar?
+
+[CodexBar](https://github.com/steipete/CodexBar) is free, open source and covers far more tools. If you want every provider, use it. Usage HUD does less on purpose: it reads the few subscriptions most people code with and turns them into one calm answer about what to use next.
 
 ## FAQ
 
+**Is it really free?** Yes. No trial, no license key, no account. Tips keep it maintained.
 **Why did my weekly usage jump?** The weekly cap is separate from the 5-hour window and can move from other Claude clients on the same plan. [Why weekly usage jumped](https://hud.thaliabloom.com/why-weekly-usage-jumped/).
-**ccusage stopped tracking Claude?** ccusage reads local logs. Usage HUD reads the same usage endpoint Claude Code's `/usage` panel reads. [When ccusage stops tracking Claude](https://hud.thaliabloom.com/ccusage-stopped-tracking-claude/).
-**Where do I buy?** [hud.thaliabloom.com](https://hud.thaliabloom.com/). $9, one time, 14-day refund. Want to check your numbers first? [claude-usage-check](https://github.com/Thalia-Bloom/claude-usage-check) is free and MIT.
-**Is there a free alternative?** [CodexBar](https://github.com/steipete/CodexBar) is free and covers more providers. If it already does the job, you do not need this.
-**Is the source available?** Not yet. This repository is the product page and the install guide.
-**Refunds?** Email support@thaliabloom.com within 14 days.
-**License?** Personal. Use it on the Macs you own.
+**Is the source available?** Not yet. This repository holds releases and the install guide.
+**Support?** support@thaliabloom.com
 
 Bloom Web Services · 30 N Gould St, Ste N, Sheridan, WY 82801 · support@thaliabloom.com
