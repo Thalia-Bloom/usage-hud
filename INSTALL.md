@@ -2,15 +2,17 @@
 
 Usage HUD is a macOS 14 or later menu-bar app. It reads local usage snapshots and does not send your prompts, transcripts, or tokens anywhere.
 
-## 1. Unzip and move the app
+## 1. Install
 
-1. Unzip `UsageHUD.zip` (Safari usually unzips it for you).
-2. Move **Usage HUD** into your Applications folder.
-3. Open **Usage HUD**.
+1. Open `UsageHUD.dmg`.
+2. Drag **Usage HUD** onto **Applications**.
+3. Open **Usage HUD** from Applications. If you open it somewhere else, it offers to move itself there.
 
-The app is signed with a Developer ID and notarized by Apple, so macOS opens it without a warning. If you built an ad-hoc test zip yourself, Gatekeeper blocks the first open: on macOS 15 or later, open the app once, then go to **System Settings → Privacy & Security** and click **Open Anyway**; on macOS 14, right-click the app → **Open** → **Open**.
+The app is signed with a Developer ID and notarized by Apple, so macOS opens it without a warning. Prefer a zip? `UsageHUD.zip` on the releases page holds the same app.
 
-The app is a menu-bar extra (no Dock icon). Click the glyph to open the panel. Right-click the glyph, or click the gear in the panel footer, for Settings.
+Usage HUD lives in the menu bar (no Dock icon). On first launch the panel opens under its menu-bar meter. Click the meter to open the panel; right-click it for Settings, Check for Updates, About and Quit.
+
+Updates install themselves after you say yes: Usage HUD checks once a day, and **Check for Updates…** checks now.
 
 ## 2. Click Set up
 
@@ -24,7 +26,24 @@ Lanes you do not have stay hidden. After you install another tool, open Settings
 
 Snapshots are written to `~/.codex-usage-hud/`. The app never requires a license check.
 
-## 3. Requirements
+## 3. Connect your agents (optional)
+
+Open **Settings › Agents** and click **Copy prompt**. Paste it into Claude Code, Codex, Gemini CLI or Cursor. That agent adds Usage HUD's read-only MCP server to each agent CLI on this Mac, asks before adding a two-line rule to their instructions, and shows you every change. See [AGENTS.md](AGENTS.md).
+
+The app's command line has two commands for this. `setup` does what the Set up button does: it finds the coding tools on this Mac, installs their background refresh, takes a first reading, and prints one line per lane with the next action for any lane that needs one. `detect` only reports what it finds and changes nothing. Both take `--json`.
+
+```sh
+'/Applications/Usage HUD.app/Contents/MacOS/CodexUsageHUD' setup
+'/Applications/Usage HUD.app/Contents/MacOS/CodexUsageHUD' detect
+```
+
+**Setting up from an agent.** You can skip the button and say to any coding agent: "Usage HUD is installed at `/Applications/Usage HUD.app`, set it up." The agent runs `setup` and tells you the next action for each lane. No login information is needed.
+
+## 4. Set your plans (optional)
+
+**Settings › Plans** shows what you pay per month next to the API value of your usage. Claude Max and ChatGPT Pro are detected; set the others or type a custom amount. API value is what your tokens would cost at pay-per-use API prices; you are never billed for it.
+
+## 5. Requirements
 
 - macOS 14 or later
 - The matching CLI signed in on this Mac: Codex, Claude Code, Gemini or Antigravity, Grok
@@ -39,7 +58,7 @@ Empty lanes tell you the next action instead of showing 0%.
 
 Set up skips jobs whose runtime is missing and tells you which lanes that affects.
 
-## 4. What each lane needs
+## 6. What each lane needs
 
 ### Codex
 
@@ -51,7 +70,7 @@ Needs Claude Code signed in on this Mac. Official window percentages come from t
 
 With Node.js and Python 3 installed, the login job `com.codexusagehud.claude-writer` runs that official fetch on a timer. If either is missing, the app runs the same fetch itself, about every 10 minutes and when you click **Refresh**, and writes `claude-usage-native.json`. Only one of the two runs at a time. You do **not** need to edit `~/.claude/settings.json` for the Claude lane to work.
 
-The first reading may show a macOS prompt asking to let `security` use "Claude Code-credentials". Click **Always Allow** (it reads the sign-in, nothing else). Click **Deny** and the Claude lane says so instead of guessing.
+Claude Code saves its sign-in with macOS's own `security` tool, and the app reads it with the same tool, so there is normally no prompt. If your Mac does ask to let `security` use "Claude Code-credentials", click **Always Allow** (it reads the sign-in, nothing else). Click **Deny** and the Claude lane says so instead of guessing.
 
 If Claude Code is not signed in, the lane reports unauthorized / missing credentials instead of a fake 0%.
 
@@ -67,7 +86,7 @@ Needs the Grok CLI signed in (`~/.grok/auth.json`). Background refresh writes `g
 
 Needs Ollama with retained server logs under `~/.ollama/logs`. The app totals evaluated-prompt and generated tokens from those logs. Background refresh is not required.
 
-## 5. Optional: Claude statusline tap
+## 7. Optional: Claude statusline tap
 
 The statusline tap is **optional** and needs Node.js. The Claude lane already fetches official usage on a timer. If you also want Claude Code’s status line to push live rate-limit numbers into the HUD, point Claude Code’s `statusLine.command` at the copied helper after Set up. Set up copies it to:
 
