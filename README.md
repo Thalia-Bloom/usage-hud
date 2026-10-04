@@ -4,7 +4,7 @@
 
 **Which AI subscription has room right now?** Usage HUD answers that in your Mac menu bar. One verdict for Claude, Codex, Gemini, Grok and local models: who is running hot, when it runs out at this pace, and which tool you can switch to.
 
-**[Download for Mac (free)](https://github.com/Thalia-Bloom/usage-hud/releases/latest/download/UsageHUD.zip)** · Apple silicon · macOS 14+ · signed and notarized by Apple
+**[Download for Mac (free)](https://github.com/Thalia-Bloom/usage-hud/releases/latest/download/UsageHUD.zip)** · Apple silicon and Intel · macOS 14+ · signed and notarized by Apple
 
 Free. If it saves you a stalled afternoon, you can [leave a tip](https://hud.thaliabloom.com/#tip).
 
@@ -25,15 +25,15 @@ Free. If it saves you a stalled afternoon, you can [leave a tip](https://hud.tha
 
 ## Install
 
-1. [Download](https://github.com/Thalia-Bloom/usage-hud/releases/latest/download/UsageHUD.zip), unzip, and move **Usage HUD** to Applications.
+1. [Download the disk image](https://github.com/Thalia-Bloom/usage-hud/releases/latest/download/UsageHUD.dmg) and drag **Usage HUD** to Applications. Prefer the terminal? `curl -fsSL https://hud.thaliabloom.com/install.sh | bash`
 2. Open it. It lives in the menu bar (no Dock icon).
-3. Click **Set up**. It finds your coding tools, hides the ones you don't have, and takes the first reading in about 10 seconds. No terminal.
+3. The first run sets itself up: it finds your coding tools, hides the ones you don't have, and takes the first reading in about 10 seconds. No terminal. Or tell your coding agent "Usage HUD is installed, set it up" and it runs `usage-hud setup` for you.
 
 Details and troubleshooting: [INSTALL.md](INSTALL.md).
 
 ## Requirements
 
-- Apple silicon Mac, macOS 14 or later.
+- Any Mac on macOS 14 or later, Apple silicon or Intel.
 - Claude Code or Codex signed in on this Mac. Nothing else to install for those two.
 - Gemini (Antigravity CLI) and Grok lanes need Node.js 18 or later.
 - The Local lane reads Ollama's logs.
