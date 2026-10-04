@@ -49,4 +49,4 @@ Details and troubleshooting: [INSTALL.md](INSTALL.md).
 **Is the source available?** Not yet. This repository holds releases and the install guide.
 **Support?** support@thaliabloom.com
 
-Bloom Web Services · 30 N Gould St, Ste N, Sheridan, WY 82801 · support@thaliabloom.com
+Thalia Bloom · support@thaliabloom.com
