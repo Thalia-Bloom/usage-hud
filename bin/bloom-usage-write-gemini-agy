@@ -1,0 +1,743 @@
+#!/usr/bin/env node
+// Write a Gemini usage snapshot from Antigravity's own quota panel — the pool
+// the user's Gemini work actually consumes. It covers both agy groups:
+// "Gemini Models" and "Claude and GPT models".
+//
+// Source: `agy -p /quota --output-format json`. agy answers read-only slash
+// commands in print mode without a model call (usage tokens are 0), so the
+// probe spends no quota. The older path POSTed to the in-process language
+// server's RetrieveUserQuotaSummary RPC; since agy 1.2.x that RPC answers
+// 401 "missing CSRF token" and the token is generated inside the agy process
+// (not in its argv, env, or logs), so it cannot be authenticated from outside.
+//
+// Every probe starts a short-lived agy, which signs in to Google. To keep that
+// human-scale (the old probe launched agy about 260 times a day):
+//   1. A cached reading younger than MIN_REFRESH_MS: do nothing.
+//   2. A cached reading younger than SPAWN_AFTER_MS: rewrite from cache
+//      with its honest age. The spacing defaults to 24h / DAILY_SPAWN_CAP
+//      (48 a day = every 30 min; 4h left the 5-hour window hours behind),
+//      so the automatic reads cover the whole day
+//      instead of spending the cap by mid-morning.
+//   3. Otherwise spawn at most once per spacing, back off exponentially after
+//      a failure, and never more than DAILY_SPAWN_CAP times per local day.
+//      The probe runs agy in its own process group from a dedicated empty
+//      workspace with its own log file, and kills that group on exit or
+//      timeout. It never taps or signals any other agy (the user's own sessions).
+// `--force` (or BLOOM_AGY_PROBE_FORCE=1) skips the spacing, backoff and
+// automatic daily cap for an attended re-read. Forced reads are counted
+// separately (FORCED_DAILY_CAP) so they never eat the automatic schedule.
+//
+// There is no other Gemini path: the old fetcher that reused the Gemini CLI's
+// OAuth client against Google directly was removed (Google has suspended
+// accounts for third-party use of that client).
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const { execFileSync } = require('child_process');
+
+const HOME = os.homedir();
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const OUT_PATH = process.env.BLOOM_USAGE_OUT || path.join(STATE_DIR, 'gemini-usage.json');
+const STATUS_PATH = process.env.BLOOM_GEMINI_STATUS_OUT || path.join(STATE_DIR, 'gemini-official-status.json');
+// Spawn bookkeeping must survive callers that point STATE_DIR at a scratch
+// dir (tests do), or the gate would reset every call.
+const PROBE_STATE_DIR = process.env.BLOOM_AGY_PROBE_STATE_DIR || STATE_DIR;
+const PROBE_STATE = path.join(PROBE_STATE_DIR, 'gemini-agy-probe-state.json');
+const PROBE_LOCK = path.join(PROBE_STATE_DIR, 'gemini-agy-probe.lock');
+const PROBE_WORKSPACE = path.join(PROBE_STATE_DIR, 'agy-probe-workspace');
+const PROBE_LOG = path.join(PROBE_STATE_DIR, 'agy-probe.log');
+// One line per live /quota read, so Gemini quota pace can be checked
+// against a real week of readings (the snapshot keeps only the latest).
+const QUOTA_HISTORY = path.join(PROBE_STATE_DIR, 'gemini-quota-history.jsonl');
+const AGY_BIN = resolveAgyBin();
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAILY_SPAWN_CAP = Math.max(1, numberEnv('BLOOM_AGY_PROBE_DAILY_CAP', 48));
+const FORCED_DAILY_CAP = numberEnv('BLOOM_AGY_PROBE_FORCED_DAILY_CAP', 4);
+const SPAWN_AFTER_MS = numberEnv('BLOOM_AGY_SPAWN_AFTER_MS', Math.round(24 * HOUR_MS / DAILY_SPAWN_CAP));
+// Past this age the snapshot says stale: one spacing plus 30 minutes for the
+// HUD refresh cadence, so a healthy lane is never stale between reads
+// (4h30m by default; codex-usage-doctor warns at the same 270 minutes).
+const STALE_AFTER_MS = numberEnv('BLOOM_AGY_STALE_AFTER_MS', SPAWN_AFTER_MS + 30 * 60 * 1000);
+const MIN_REFRESH_MS = numberEnv('BLOOM_AGY_MIN_REFRESH_MS', 10 * 60 * 1000);
+const BACKOFF_MAX_MS = numberEnv('BLOOM_AGY_PROBE_BACKOFF_MAX_MS', 24 * HOUR_MS);
+const PROBE_TIMEOUT_MS = numberEnv('BLOOM_AGY_PROBE_TIMEOUT_MS', 45 * 1000);
+const KILL_GRACE_MS = 2000;
+const SPAWN_DISABLED = process.env.BLOOM_AGY_SPAWN === '0';
+const FORCE = process.argv.includes('--force') || process.env.BLOOM_AGY_PROBE_FORCE === '1';
+const SOURCE = 'antigravity cli /quota';
+
+// Process groups this run started; killed on any exit path.
+const liveGroups = new Set();
+
+if (require.main === module) main();
+
+async function main() {
+  installExitGuards();
+  try {
+    const now = Date.now();
+    const checkedAt = new Date(now).toISOString();
+    const cached = readCachedQuota();
+    const cacheAge = cached ? now - Date.parse(cached.capturedAt) : Infinity;
+
+    // Called at statusline frequency: with a recent quota on disk, do nothing.
+    if (!FORCE && cacheAge < MIN_REFRESH_MS) return;
+
+    if (!FORCE && cacheAge < SPAWN_AFTER_MS) {
+      // Cached data keeps the quota's own capture stamp — restamping to now
+      // would launder its age past codex-usage-doctor's freshness check.
+      writeSnapshot(cached.quota, cached.capturedAt, cached.capturedAt, {
+        verdict: cacheAge > STALE_AFTER_MS ? 'stale' : 'fresh',
+        checkedAt,
+        reason: `Quota from cache, ${ageLabel(cached.capturedAt)} old; agy is re-read at most every ${Math.round(SPAWN_AFTER_MS / HOUR_MS * 10) / 10}h.`
+      }, cached.source);
+      return;
+    }
+
+    let quota = null;
+    let blocked = null;
+    if (SPAWN_DISABLED) {
+      blocked = 'spawn disabled (BLOOM_AGY_SPAWN=0)';
+    } else if (!isExecutable(AGY_BIN)) {
+      // Absent tool: no spawn attempt, no failure counter, no daily spawn spent.
+      blocked = 'agy is not installed';
+    } else {
+      const gate = spawnGate(readProbeState(), now, FORCE);
+      if (!gate.allowed) {
+        blocked = gate.reason;
+      } else {
+        const lock = acquireLock();
+        if (!lock) {
+          blocked = 'another probe is reading agy quota';
+        } else {
+          try {
+            recordAttemptStart(now, FORCE);
+            const result = await readQuotaViaCli();
+            recordAttemptEnd(result, Date.now());
+            if (result.quota) quota = result.quota;
+            else blocked = `agy /quota failed: ${result.error}`;
+          } finally {
+            releaseLock(lock);
+          }
+        }
+      }
+    }
+
+    if (quota) {
+      const stamp = new Date().toISOString();
+      writeSnapshot(quota, stamp, stamp, { verdict: 'fresh', checkedAt: stamp, reason: null }, SOURCE);
+      appendQuotaHistory(quota, stamp);
+      return;
+    }
+
+    // Stale cache beats nothing.
+    if (cached) {
+      writeSnapshot(cached.quota, cached.capturedAt, cached.capturedAt, {
+        verdict: cacheAge > STALE_AFTER_MS ? 'stale' : 'fresh',
+        checkedAt,
+        reason: `Showing Antigravity quota ${ageLabel(cached.capturedAt)} old; ${blocked || 'probe unavailable'}.`
+      }, cached.source);
+      return;
+    }
+
+    // Every strategy is exhausted and there is no cache to fall back on: the
+    // lane is genuinely dark this run. Leaving this silent used to exit 0
+    // with nothing written anywhere, so bloom-budget-update had no way to
+    // see the lane died. Write a status file, like the Claude official
+    // fetch does on its own failure paths.
+    if (!isExecutable(AGY_BIN)) {
+      // No Antigravity CLI on this Mac: the lane is absent, not broken, so a
+      // refresh for someone without Gemini must not report a failure.
+      writeFailureStatus('not_installed', 'Gemini usage reads the Antigravity CLI (agy) quota; agy is not installed.');
+      return;
+    }
+    const message = `no cached quota and ${blocked || 'probe unavailable'}`;
+    console.error(`gemini agy probe: ${message}`);
+    writeFailureStatus('offline', message);
+    process.exitCode = 1;
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    console.error(message);
+    writeFailureStatus('offline', message);
+    process.exitCode = 1;
+  } finally {
+    killLiveGroups('SIGKILL');
+  }
+}
+
+function writeFailureStatus(status, message) {
+  try {
+    writeJSON(STATUS_PATH, {
+      schemaVersion: 1,
+      status,
+      message,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (_) { /* never let a status write crash the writer */ }
+}
+
+// ---- spawn gate -----------------------------------------------------------
+
+function spawnGate(state, now, force) {
+  const today = localDate(new Date(now));
+  if (force) {
+    const forcedToday = state.day === today ? integer(state.forcedToday, 0) : 0;
+    if (forcedToday >= FORCED_DAILY_CAP) {
+      return { allowed: false, reason: `attended re-read cap reached (${forcedToday}/${FORCED_DAILY_CAP})` };
+    }
+    return { allowed: true, reason: 'forced' };
+  }
+  const spawnsToday = state.day === today ? integer(state.spawnsToday, 0) : 0;
+  if (spawnsToday >= DAILY_SPAWN_CAP) {
+    return { allowed: false, reason: `daily probe cap reached (${spawnsToday}/${DAILY_SPAWN_CAP})` };
+  }
+  const lastAttempt = Date.parse(state.lastAttemptAt || '');
+  if (Number.isFinite(lastAttempt)) {
+    const failures = Math.max(0, integer(state.consecutiveFailures, 0));
+    const wait = failures > 0 ? backoffMs(failures) : SPAWN_AFTER_MS;
+    if (now - lastAttempt < wait) {
+      const nextAt = new Date(lastAttempt + wait).toISOString();
+      return {
+        allowed: false,
+        reason: failures > 0
+          ? `backing off after ${failures} failed probe(s) until ${nextAt}`
+          : `probed ${ageLabel(state.lastAttemptAt)} ago; next probe after ${nextAt}`
+      };
+    }
+  }
+  return { allowed: true, reason: 'due' };
+}
+
+function backoffMs(failures) {
+  // One spacing, then doubling (4h, 8h, 16h by default), capped at 24h.
+  const exp = Math.min(Math.max(1, failures), 8) - 1;
+  return Math.min(SPAWN_AFTER_MS * 2 ** exp, BACKOFF_MAX_MS);
+}
+
+function readProbeState() {
+  return readJSON(PROBE_STATE) || {};
+}
+
+function recordAttemptStart(now, force) {
+  const state = readProbeState();
+  const today = localDate(new Date(now));
+  const sameDay = state.day === today;
+  const spawnsToday = sameDay ? integer(state.spawnsToday, 0) : 0;
+  const forcedToday = sameDay ? integer(state.forcedToday, 0) : 0;
+  writeJSON(PROBE_STATE, {
+    ...state,
+    schemaVersion: 2,
+    day: today,
+    // spawnsToday counts automatic reads only; forcedToday counts attended ones.
+    spawnsToday: force ? spawnsToday : spawnsToday + 1,
+    forcedToday: force ? forcedToday + 1 : forcedToday,
+    lastAttemptAt: new Date(now).toISOString(),
+    lastAttemptForced: Boolean(force),
+    dailyCap: DAILY_SPAWN_CAP,
+    forcedDailyCap: FORCED_DAILY_CAP,
+    spawnAfterMs: SPAWN_AFTER_MS
+  });
+}
+
+function recordAttemptEnd(result, now) {
+  const state = readProbeState();
+  const failures = result.quota ? 0 : integer(state.consecutiveFailures, 0) + 1;
+  const next = {
+    ...state,
+    consecutiveFailures: failures,
+    lastResultAt: new Date(now).toISOString(),
+    lastResult: result.quota ? 'ok' : 'failed',
+    lastError: result.quota ? null : String(result.error || 'unknown').slice(0, 300),
+    lastDurationMs: result.durationMs
+  };
+  if (result.quota) next.lastSuccessAt = next.lastResultAt;
+  const lastAttempt = Date.parse(next.lastAttemptAt || '') || now;
+  next.nextAttemptAt = new Date(lastAttempt + (failures ? backoffMs(failures) : SPAWN_AFTER_MS)).toISOString();
+  writeJSON(PROBE_STATE, next);
+}
+
+function acquireLock() {
+  fs.mkdirSync(PROBE_STATE_DIR, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(PROBE_LOCK, 'wx', 0o600);
+      fs.writeSync(fd, `${process.pid}\n`);
+      return fd;
+    } catch (_) {
+      const pid = integer(readText(PROBE_LOCK).trim(), 0);
+      let alive = false;
+      if (pid > 0) {
+        try { process.kill(pid, 0); alive = true; } catch (_) {}
+      }
+      let lockAge = Infinity;
+      try { lockAge = Date.now() - fs.statSync(PROBE_LOCK).mtimeMs; } catch (_) {}
+      if (alive && lockAge < PROBE_TIMEOUT_MS * 3) return null;
+      try { fs.unlinkSync(PROBE_LOCK); } catch (_) {}
+    }
+  }
+  return null;
+}
+
+function releaseLock(fd) {
+  try { fs.closeSync(fd); } catch (_) {}
+  try { fs.unlinkSync(PROBE_LOCK); } catch (_) {}
+}
+
+// ---- agy /quota -----------------------------------------------------------
+
+function readQuotaViaCli() {
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    if (!isExecutable(AGY_BIN)) {
+      resolve({ quota: null, error: `agy not executable at ${shortPath(AGY_BIN)}`, durationMs: 0 });
+      return;
+    }
+    try {
+      fs.mkdirSync(PROBE_WORKSPACE, { recursive: true, mode: 0o700 });
+      rotateLog(PROBE_LOG, 512 * 1024);
+    } catch (_) {}
+    const timeoutSec = Math.max(10, Math.floor(PROBE_TIMEOUT_MS / 1000) - 5);
+    let child;
+    try {
+      child = spawn(AGY_BIN, [
+        '-p', '/quota',
+        '--output-format', 'json',
+        '--print-timeout', `${timeoutSec}s`,
+        '--log-file', PROBE_LOG
+      ], {
+        cwd: PROBE_WORKSPACE,
+        // Own process group: we can kill everything we started and nothing else.
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: probeEnv(process.env)
+      });
+    } catch (err) {
+      resolve({ quota: null, error: `spawn failed: ${err.message || err}`, durationMs: 0 });
+      return;
+    }
+    if (child.pid) liveGroups.add(child.pid);
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    child.stdout.on('data', (chunk) => { if (stdout.length < 256 * 1024) stdout += chunk; });
+    child.stderr.on('data', (chunk) => { if (stderr.length < 64 * 1024) stderr += chunk; });
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reapGroup(child.pid);
+      const quota = error ? null : parseQuotaOutput(stdout);
+      resolve({
+        quota,
+        error: quota ? null : (error || firstLine(stderr) || firstLine(stdout) || 'no quota groups in agy output'),
+        durationMs: Date.now() - startedAt
+      });
+    };
+    const timer = setTimeout(() => finish(`timed out after ${Math.round(PROBE_TIMEOUT_MS / 1000)}s`), PROBE_TIMEOUT_MS);
+    child.on('error', (err) => finish(`agy error: ${err.message || err}`));
+    child.on('close', (code, signal) => {
+      finish(code === 0 ? null : `agy exited ${code == null ? signal : code}: ${firstLine(stderr) || firstLine(stdout) || 'no output'}`);
+    });
+  });
+}
+
+function reapGroup(pgid) {
+  if (!pgid) return;
+  // agy ignores SIGTERM when idle, so follow up with SIGKILL after a grace.
+  if (!groupAlive(pgid)) { liveGroups.delete(pgid); return; }
+  try { process.kill(-pgid, 'SIGTERM'); } catch (_) {}
+  const deadline = Date.now() + KILL_GRACE_MS;
+  while (Date.now() < deadline && groupAlive(pgid)) sleepSync(100);
+  if (groupAlive(pgid)) {
+    try { process.kill(-pgid, 'SIGKILL'); } catch (_) {}
+  }
+  liveGroups.delete(pgid);
+}
+
+function groupAlive(pgid) {
+  try { process.kill(-pgid, 0); return true; } catch (_) { return false; }
+}
+
+function killLiveGroups(signal) {
+  for (const pgid of liveGroups) {
+    try { process.kill(-pgid, signal); } catch (_) {}
+  }
+  liveGroups.clear();
+}
+
+function installExitGuards() {
+  process.on('exit', () => killLiveGroups('SIGKILL'));
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    process.on(sig, () => {
+      killLiveGroups('SIGKILL');
+      process.exit(128 + (os.constants.signals[sig] || 1));
+    });
+  }
+}
+
+// Parse `agy -p /quota --output-format json`; accept the tab-separated text
+// form too. Returns the RPC-shaped quota the rest of the lane already reads:
+// { groups: [{ displayName, buckets: [{ bucketId, window, remainingFraction, resetTime }] }] }
+function parseQuotaOutput(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  let parsed = null;
+  try { parsed = JSON.parse(raw); } catch (_) {
+    const start = raw.indexOf('{');
+    if (start >= 0) {
+      try { parsed = JSON.parse(raw.slice(start)); } catch (_) {}
+    }
+  }
+  const data = parsed && parsed.command && parsed.command.data;
+  if (data && Array.isArray(data.groups)) {
+    const groups = data.groups.map((group) => ({
+      displayName: String(group.name || group.displayName || 'Antigravity'),
+      description: group.description || undefined,
+      buckets: (Array.isArray(group.buckets) ? group.buckets : []).map((bucket) => ({
+        bucketId: bucket.id || bucket.bucketId || undefined,
+        name: bucket.name || undefined,
+        window: normalizeWindow(bucket.window),
+        remainingFraction: clampFraction(bucket.remaining_fraction != null ? bucket.remaining_fraction : bucket.remainingFraction),
+        resetTime: bucket.reset_time || bucket.resetTime || null
+      })).filter((bucket) => bucket.remainingFraction != null)
+    })).filter((group) => group.buckets.length);
+    return groups.length ? { groups, source: SOURCE } : null;
+  }
+  const textBody = parsed && typeof parsed.response === 'string' ? parsed.response : raw;
+  return parseQuotaText(textBody);
+}
+
+function parseQuotaText(text) {
+  const groups = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const cols = line.split('\t').map((col) => col.trim());
+    if (cols.length < 4) continue;
+    const pct = Number(String(cols[2]).replace('%', ''));
+    if (!Number.isFinite(pct)) continue;
+    groups.push({
+      displayName: cols[0],
+      buckets: [{
+        bucketId: `${slug(cols[0])}-weekly`,
+        name: cols[1],
+        window: /5\s*h|five/i.test(cols[1]) ? '5h' : 'week',
+        remainingFraction: clampFraction(pct / 100),
+        resetTime: cols[3] || null
+      }]
+    });
+  }
+  return groups.length ? { groups, source: `${SOURCE} (text)` } : null;
+}
+
+function normalizeWindow(value) {
+  const text = String(value || '').toLowerCase();
+  if (/^5h$|five|5_hour|5-hour|hour/.test(text)) return '5h';
+  return 'week';
+}
+
+function clampFraction(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(1, n));
+}
+
+function probeEnv(env) {
+  const clean = { ...env };
+  // agy uses its own Google sign-in; never let a metered key or token steer it.
+  for (const key of [
+    'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_GENAI_USE_VERTEXAI',
+    'GOOGLE_AUTH_ACCESS_TOKEN', 'GOOGLE_OAUTH_ACCESS_TOKEN', 'GOOGLE_CLOUD_ACCESS_TOKEN', 'CLOUDSDK_AUTH_ACCESS_TOKEN'
+  ]) delete clean[key];
+  return clean;
+}
+
+// ---- snapshot ---------------------------------------------------------------
+
+function readCachedQuota() {
+  const prev = readJSON(OUT_PATH);
+  if (prev && prev.antigravity && prev.antigravity.capturedAt && prev.antigravity.quota) {
+    return {
+      capturedAt: prev.antigravity.capturedAt,
+      quota: prev.antigravity.quota,
+      source: prev.antigravity.quota.source || (prev.source && /^antigravity/.test(prev.source) ? prev.source : 'antigravity quota api')
+    };
+  }
+  return null;
+}
+
+function writeSnapshot(quota, quotaAt, capturedAt, health, source) {
+  const buckets = [];
+  for (const group of quota.groups || []) {
+    for (const bucket of group.buckets || []) {
+      const window = bucket.window === '5h' ? '5h' : 'week';
+      buckets.push({
+        group: group.displayName || 'Antigravity',
+        id: bucket.bucketId || `${group.displayName}-${window}`,
+        window,
+        remainingFraction: bucket.remainingFraction != null ? Number(bucket.remainingFraction) : 1,
+        usedPct: round1((1 - Number(bucket.remainingFraction != null ? bucket.remainingFraction : 1)) * 100),
+        resetAt: bucket.resetTime || null,
+        label: `${shortGroup(group.displayName)} ${window === '5h' ? '5h' : 'weekly'}`
+      });
+    }
+  }
+
+  const weekly = buckets.filter((b) => b.window === 'week').sort((a, b) => b.usedPct - a.usedPct);
+  const fiveHour = buckets.filter((b) => b.window === '5h').sort((a, b) => b.usedPct - a.usedPct);
+  // The row is named "Gemini" — it must read the Gemini-models pool, not
+  // whichever pool (e.g. "Claude and GPT models" via Antigravity) happens to
+  // be fullest. Fall back to the fullest bucket only when no Gemini group
+  // reported a bucket for that window at all. Full inventory (every pool)
+  // stays visible in pools/contributors/skills/extraUsage regardless.
+  const isGeminiBucket = (b) => /gemini/i.test(b.group || '');
+  const week = weekly.find(isGeminiBucket) || weekly[0];
+  const session = fiveHour.find(isGeminiBucket) || fiveHour[0];
+  const sourceLabel = source || SOURCE;
+
+  const snapshot = pruneUndefined({
+    schemaVersion: 1,
+    provider: 'gemini',
+    displayName: 'Gemini',
+    source: sourceLabel,
+    sourceKind: /\/quota/.test(sourceLabel) ? 'official_interactive' : 'official_api',
+    confidence: 'official',
+    confidenceNote: /\/quota/.test(sourceLabel)
+      ? 'Antigravity CLI quota panel (agy -p /quota, no model call) — the pool agy sessions consume. Groups: Gemini models; Claude and GPT models.'
+      : 'Antigravity quota summary — the pool agy sessions actually consume. Groups: Gemini models; Claude/GPT via Antigravity.',
+    updatedAt: quotaAt,
+    eventAt: quotaAt,
+    capturedAt,
+    extraUsage: buckets.length ? buckets.map((b) => `${b.label} ${b.usedPct}%`).join(' · ') : undefined,
+    week: week ? {
+      label: week.label,
+      usedPct: week.usedPct,
+      resetAt: week.resetAt || undefined,
+      resetLabel: week.resetAt ? shortLabel(week.resetAt) : undefined
+    } : undefined,
+    currentSession: session ? {
+      label: session.label,
+      usedPct: session.usedPct,
+      resetAt: session.resetAt || undefined,
+      resetLabel: session.resetAt ? shortLabel(session.resetAt) : undefined
+    } : undefined,
+    // One row per agy quota group, for per-group pacing.
+    pools: poolRows(buckets),
+    contributors: buckets.map((b) => ({
+      label: b.label,
+      percent: b.usedPct,
+      note: `Resets ${shortLabel(b.resetAt) || 'unknown'} · ${b.group}`
+    })),
+    skills: buckets.map((b) => ({ name: b.label, percent: b.usedPct })),
+    subagents: [],
+    // Only the primary pair goes into windows[], with canonical role ids, so
+    // the panel's schema-v2 decoder lands on the same buckets the v1
+    // week/currentSession fields already use. Full inventory
+    // stays in pools/contributors/skills/extraUsage.
+    windows: [
+      session && {
+        id: '5h', label: session.label, usedPct: session.usedPct,
+        resetAt: session.resetAt, eventAt: quotaAt,
+        state: session.resetAt && Date.parse(session.resetAt) <= Date.now() ? 'expired' : 'live'
+      },
+      week && {
+        id: 'week', label: week.label, usedPct: week.usedPct,
+        resetAt: week.resetAt, eventAt: quotaAt,
+        state: week.resetAt && Date.parse(week.resetAt) <= Date.now() ? 'expired' : 'live'
+      }
+    ].filter(Boolean),
+    antigravity: { capturedAt: quotaAt, quota },
+    health,
+    sourcePath: PROBE_LOG
+  });
+  writeJSON(OUT_PATH, snapshot);
+}
+
+function appendQuotaHistory(quota, at) {
+  const pools = [];
+  for (const group of quota.groups || []) {
+    for (const bucket of group.buckets || []) {
+      if (bucket.remainingFraction == null) continue;
+      pools.push(pruneUndefined({
+        id: poolId(group.displayName),
+        window: bucket.window === '5h' ? '5h' : 'week',
+        usedPct: round1((1 - Number(bucket.remainingFraction)) * 100),
+        resetAt: bucket.resetTime || undefined
+      }));
+    }
+  }
+  if (!pools.length) return;
+  try {
+    fs.mkdirSync(path.dirname(QUOTA_HISTORY), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(QUOTA_HISTORY, `${JSON.stringify({ at, pools })}\n`, { mode: 0o600 });
+  } catch (_) {}
+}
+
+function poolRows(buckets) {
+  const rows = [];
+  for (const b of buckets.filter((item) => item.window === 'week')) {
+    const id = poolId(b.group);
+    if (rows.some((row) => row.id === id)) continue;
+    rows.push({
+      id,
+      name: b.group,
+      window: 'week',
+      remainingFraction: Math.round(b.remainingFraction * 10000) / 10000,
+      usedPct: b.usedPct,
+      resetAt: b.resetAt || undefined
+    });
+  }
+  return rows.length ? rows : undefined;
+}
+
+function poolId(name) {
+  if (/claude|gpt/i.test(name || '')) return 'claude-gpt';
+  if (/gemini/i.test(name || '')) return 'gemini';
+  return slug(name || 'antigravity');
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+function siblingBin(name) {
+  const dirs = [];
+  if (process.env.BLOOM_USAGE_BIN_DIR) dirs.push(process.env.BLOOM_USAGE_BIN_DIR);
+  dirs.push(__dirname);
+  dirs.push(path.join(HOME, '.local', 'bin'));
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    try { if (fs.existsSync(candidate)) return candidate; } catch (_) {}
+  }
+  return path.join(HOME, '.local', 'bin', name);
+}
+
+function shortGroup(name) {
+  if (!name) return 'Antigravity';
+  if (/gemini/i.test(name)) return 'Gemini';
+  if (/claude|gpt/i.test(name)) return 'Claude/GPT (agy)';
+  return name;
+}
+
+function shortLabel(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).replace(',', '');
+}
+
+function ageLabel(iso) {
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return 'unknown age';
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.round(minutes / 60 * 10) / 10}h`;
+}
+
+function localDate(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function rotateLog(file, maxBytes) {
+  try {
+    if (fs.statSync(file).size > maxBytes) fs.renameSync(file, `${file}.1`);
+  } catch (_) {}
+}
+
+// agy is installed by the Antigravity CLI setup, which can land it on PATH,
+// in ~/.local/bin, or (Homebrew, Apple Silicon) /opt/homebrew/bin -- ~/.local/bin
+// alone missed the other two on a stock install.
+function resolveAgyBin() {
+  if (process.env.BLOOM_AGY_BIN) return process.env.BLOOM_AGY_BIN;
+  const onPath = which('agy');
+  if (onPath) return onPath;
+  const candidates = [
+    path.join(HOME, '.local', 'bin', 'agy'),
+    '/opt/homebrew/bin/agy'
+  ];
+  for (const candidate of candidates) {
+    if (isExecutable(candidate)) return candidate;
+  }
+  return candidates[0];
+}
+
+function which(name) {
+  const pathEnv = process.env.PATH || '';
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    if (isExecutable(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Prefer the bundled bloom-node shim over a bare "node", the same fallback
+// list bloom-usage-statusline-tap's resolveNodeBin() uses: a launchd or
+// minimal-PATH environment can have no "node" at all.
+function resolveNodeBin() {
+  if (process.env.BLOOM_NODE_BIN) return process.env.BLOOM_NODE_BIN;
+  const shim = siblingBin('bloom-node');
+  try { if (fs.existsSync(shim)) return shim; } catch (_) {}
+  return process.execPath;
+}
+
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return fs.statSync(file).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+function firstLine(text) {
+  const line = String(text || '').split(/\r?\n/).map((item) => item.trim()).find(Boolean);
+  return line ? line.slice(0, 200) : '';
+}
+
+function shortPath(value) {
+  return String(value || '').startsWith(HOME) ? `~${String(value).slice(HOME.length)}` : String(value || '');
+}
+
+function slug(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'group';
+}
+
+function readJSON(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return null; }
+}
+
+function readText(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch (_) { return ''; }
+}
+
+function writeJSON(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, 0o600); } catch (_) {}
+}
+
+function pruneUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
+}
+
+function numberEnv(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function integer(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function round1(value) {
+  return Math.round(Number(value) * 10) / 10;
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+module.exports = { parseQuotaOutput, spawnGate, backoffMs, localDate, SPAWN_AFTER_MS, STALE_AFTER_MS };

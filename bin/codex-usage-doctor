@@ -1,0 +1,1035 @@
+#!/usr/bin/env node
+// Local reliability diagnostics for Usage HUD. It reports file health,
+// writer status, and the newest parseable Codex rate-limit event without
+// printing prompts, messages, tokens, or secrets.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const HOME = os.homedir();
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, '.codex');
+const SESSIONS_ROOT = path.join(CODEX_HOME, 'sessions');
+const JSON_MODE = process.argv.includes('--json');
+const OUTPUT_SCHEMA_VERSION = 1;
+
+const checks = [];
+
+main();
+
+function main() {
+  if (!fs.existsSync(STATE_DIR)) {
+    // Before Set up there is nothing to check yet; that is normal, not a fault.
+    add('ok', 'state dir', 'Not set up yet \u2014 open Usage HUD and click Set up');
+  } else {
+    checkPath('state dir', STATE_DIR, { dir: true, required: true, privateMode: true });
+  }
+  // A lane whose tool is not on this Mac gets one plain line, not a wall of
+  // FAILs about files that were never expected to exist.
+  if (fs.existsSync(CODEX_HOME) || fs.existsSync(path.join(STATE_DIR, 'codex-usage.json'))) checkCodexLane();
+  else add('ok', 'codex', 'not installed on this Mac; the Codex lane stays hidden');
+
+  if (fs.existsSync(path.join(HOME, '.claude'))) checkClaudeLane();
+  else add('ok', 'claude', 'Claude Code not installed on this Mac; the Claude lane stays hidden');
+
+  if (grokConfigured()) checkWriterErrorLog('grok writer log', 'grok-writer.err.log');
+  if (geminiNotInstalled()) add('ok', 'gemini', 'Antigravity CLI (agy) not installed; the Gemini lane stays hidden');
+  else checkLaneSnapshot('gemini', 60, 'agy /quota probe runs about every 30 min (48 a day) and backs off after failures; see gemini-agy-probe-state.json');
+  if (grokConfigured()) checkLaneSnapshot('grok', 120, 'billing refresh may be failing');
+  else add('ok', 'grok', 'Grok CLI not installed or not_set_up; run `grok login` to enable the lane');
+  checkLaunchAgents();
+}
+
+function geminiNotInstalled() {
+  const status = readFirst([path.join(STATE_DIR, 'gemini-official-status.json')]);
+  const snapshot = readFirst([path.join(STATE_DIR, 'gemini-usage.json')]);
+  if (snapshot.value) return false;
+  if (status.value && status.value.status === 'not_installed') return true;
+  // No probe has run yet (fresh Mac): agy simply is not there.
+  return !fs.existsSync(path.join(HOME, '.local', 'bin', 'agy')) && !fs.existsSync(path.join(HOME, '.antigravity'));
+}
+
+function checkCodexLane() {
+  // Failed account polls retain the cached observation and write stderr.
+  // A valid cached quota must not hide that failure signal.
+  checkWriterErrorLog('codex writer log', 'codex-writer.err.log');
+  const usage = readFirst([path.join(STATE_DIR, 'codex-usage.json')]);
+  const snap = usage.value;
+  const files = newestJSONLFiles(SESSIONS_ROOT).slice(0, 80);
+  const parsed = findNewestRateLimit(files);
+  const official = currentAuthoritativeCodex(snap) && (!parsed ||
+    (validRecent(parsed.timestamp, Number.MAX_SAFE_INTEGER) && Date.parse(snap.eventAt) >= Date.parse(parsed.timestamp)));
+  if (official) {
+    add('ok', 'codex snapshot', 'fresh authoritative Codex account reading; local session history is optional');
+    checkLaneHealth('codex', snap);
+    checkWindowContract('codex', snap);
+    return;
+  }
+  checkPath('codex home', CODEX_HOME, { dir: true, required: true });
+  if (snap) {
+    checkLaneHealth('codex', snap);
+    checkWindowContract('codex', snap);
+    for (const status of [snap.providerHealth, snap.officialUsageStatus]) {
+      if (status && (status.exitCode || status.signal || !['ok', 'ready', 'available'].includes(status.status))) {
+        const severity = ['unauthorized', 'no_credential', 'invalid'].includes(status.status) ? 'fail' : 'warn';
+        add(severity, 'codex health', 'latest provider check failed or is unavailable');
+      }
+    }
+  }
+  if (files.length === 0) {
+    add('warn', 'codex', 'no sessions yet; run one Codex session to start usage readings');
+    return;
+  }
+  checkPath('codex sessions', SESSIONS_ROOT, { dir: true, required: true });
+
+  add(files.length > 0 ? 'ok' : 'fail', 'session logs', files.length ? `${files.length} recent jsonl files visible` : 'no Codex session jsonl files found');
+
+  if (parsed) {
+    const eventDate = new Date(parsed.timestamp || 'invalid');
+    const age = ageText(eventDate);
+    const primary = windowSummary(parsed.rate.primary);
+    const secondary = windowSummary(parsed.rate.secondary);
+    add(!validRecent(parsed.timestamp, 24 * 60 * 60 * 1000) ? 'warn' : 'ok', 'rate-limit event', `${parsed.limitId || 'unknown limit'} · event ${age} · ${primary} · ${secondary}`);
+  } else {
+    add('fail', 'rate-limit event', 'no parseable rate_limits payload found in recent Codex logs');
+  }
+
+  if (usage.value) {
+    const snap = usage.value;
+    const confidence = snap.confidence || 'undeclared';
+    const captured = snap.capturedAt || snap.updatedAt;
+    const event = snap.eventAt || snap.updatedAt;
+    add(!validRecent(event, 24 * 60 * 60 * 1000) || !validRecent(captured, 24 * 60 * 60 * 1000) ? 'warn' : 'ok', 'codex snapshot', `${shortPath(usage.path)} · ${confidence} · checked ${ageText(captured)} · event ${ageText(event)}`);
+  } else {
+    add('warn', 'codex snapshot', 'no codex-usage.json yet; writer may not have run');
+  }
+}
+
+function validRecent(value, maxAge) {
+  const stamp = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(stamp) && stamp <= Date.now() && Date.now() - stamp <= maxAge;
+}
+
+function currentAuthoritativeCodex(snap) {
+  if (!snap || snap.provider !== 'codex' || snap.sourceKind !== 'official_app_server'
+      || snap.source !== 'Codex account/rateLimits/read' || snap.confidence !== 'official'
+      || snap.health?.verdict !== 'fresh') return false;
+  const recent = value => validRecent(value, 30 * 60 * 1000);
+  if (![snap.capturedAt, snap.eventAt, snap.health.checkedAt].every(recent)) return false;
+  if (Date.parse(snap.eventAt) > Date.parse(snap.capturedAt)) return false;
+  for (const status of [snap.providerHealth, snap.officialUsageStatus]) {
+    if (status && (status.exitCode || status.signal || !['ok', 'ready', 'available'].includes(status.status))) return false;
+  }
+  const weeklyOnly = snap.accountQuotaCapability === 'weekly_only' && !snap.currentSession;
+  const required = weeklyOnly ? ['week'] : ['5h', 'week'];
+  if (!Array.isArray(snap.windows) || snap.windows.length !== required.length) return false;
+  return required.every(id => {
+    const matches = snap.windows.filter(w => w?.id === id);
+    if (matches.length !== 1) return false;
+    const w = matches[0];
+    return w.state === 'live' && typeof w.usedPct === 'number' && Number.isFinite(w.usedPct)
+      && w.usedPct >= 0 && w.usedPct <= 100 && typeof w.resetAt === 'string' && Date.parse(w.resetAt) > Date.now()
+      && Date.parse(w.resetAt) - Date.parse(w.eventAt) <= (id === '5h' ? 300 : 10080) * 60000
+      && recent(w.eventAt) && Date.parse(w.eventAt) <= Date.parse(snap.capturedAt)
+      && (!w.capturedAt || recent(w.capturedAt));
+  });
+}
+
+function grokConfigured() {
+  const auth = path.join(process.env.GROK_HOME || path.join(HOME, '.grok'), 'auth.json');
+  try { fs.lstatSync(auth); return true; } catch (err) { if (err.code !== 'ENOENT') return true; }
+  if (grokSessionEvidence(path.join(path.dirname(auth), 'sessions'))) return true;
+  const file = path.join(STATE_DIR, 'grok-usage.json');
+  try { fs.lstatSync(file); } catch (err) { return err.code !== 'ENOENT'; }
+  const snap = readFirst([file]).value;
+  return !grokUnusedSnapshot(snap);
+}
+
+// Metadata-only prior-use evidence: exact sessions/<project>/<session>/summary.json.
+// Bound directory entries to 500. Errors, symlinks, and overflow stay actionable;
+// empty directories and unrelated files alone do not establish prior use.
+function grokSessionEvidence(root) {
+  let remaining = 500;
+  function visit(dir, depth) {
+    let stream;
+    try {
+      stream = fs.opendirSync(dir);
+      let entry;
+      while ((entry = stream.readSync())) {
+        if (--remaining < 0) return true;
+        if (![entry.isFile(), entry.isDirectory(), entry.isSymbolicLink(), entry.isBlockDevice(),
+          entry.isCharacterDevice(), entry.isFIFO(), entry.isSocket()].some(Boolean)) return true;
+        if (depth === 2) {
+          if (entry.name === 'summary.json') return true;
+        } else if (entry.isSymbolicLink() || (entry.isDirectory() && visit(path.join(dir, entry.name), depth + 1))) {
+          return true;
+        }
+      }
+      return false;
+    } catch (err) { return err.code !== 'ENOENT'; }
+    finally { if (stream) stream.closeSync(); }
+  }
+  return visit(root, 0);
+}
+
+function grokUnusedSnapshot(snap) {
+  const quiet = snap?.health?.verdict === 'not_set_up'
+    || (snap?.health?.verdict === 'broken'
+      && snap.schemaVersion === 1 && snap.provider === 'grok'
+      && snap.source === 'grok cli billing + local sessions'
+      && snap.sourceKind === 'local_session_log' && snap.confidence === 'low'
+      && snap.health.reason === 'No grok CLI auth found (~/.grok/auth.json). Run `grok login`.');
+  return quiet && snap.official == null && snap.week == null && snap.currentSession == null
+    && snap.providerHealth == null && snap.officialUsageStatus == null && snap.extraUsage == null
+    && Array.isArray(snap.windows) && snap.windows.length === 0;
+}
+
+function checkClaudeLane() {
+
+  // Every lane the HUD trusts gets a freshness check. A dead Claude keepalive
+  // or silently-failing Gemini fetch used to report all-OK while the panel
+  // served stale percentages.
+  checkLaneSnapshot('claude', 15, 'keepalive writer (60s) may be dead');
+  checkClaudeStatuslineTap();
+  checkClaudeOfficialUsage();
+  checkClaudeFetchInterpreter();
+  checkFableWeekly();
+  checkClaudeWindowContract();
+  checkClaudeStatuslineCommand();
+  checkClaudeBudgetGuardHook();
+  checkClaudeBudgetMode();
+  checkWriterErrorLog('claude writer log', 'claude-writer.err.log');
+}
+
+function checkLaunchAgents() {
+  checkLaunchAgent('com.codexusagehud.app');
+  // Set up installs a writer only for tools it found.
+  if (fs.existsSync(CODEX_HOME)) checkLaunchAgent('com.codexusagehud.codex-writer');
+  if (fs.existsSync(path.join(HOME, '.claude'))) checkLaunchAgent('com.codexusagehud.claude-writer');
+  if (grokConfigured()) checkLaunchAgent('com.codexusagehud.grok-writer');
+  checkLaunchAgent('com.codexusagehud.refresh');
+  checkOptionalLaunchAgent('com.codexusagehud.live-scraper', 'optional Claude official /usage scraper; keep disabled to avoid macOS TCC prompts');
+
+  const verdict = doctorVerdict();
+  if (JSON_MODE) {
+    console.log(JSON.stringify({ schemaVersion: OUTPUT_SCHEMA_VERSION, ok: verdict === 'ok', verdict, checks }, null, 2));
+  } else {
+    for (const c of checks) {
+      const mark = c.status === 'ok' ? 'OK ' : c.status === 'warn' ? 'WARN' : 'FAIL';
+      console.log(`${mark}  ${c.name}: ${c.detail}`);
+    }
+  }
+
+  // A warning is not a green machine result. Keep fail and warn distinct so
+  // schedulers can route them without parsing prose.
+  process.exitCode = verdict === 'fail' ? 1 : verdict === 'warn' ? 2 : 0;
+}
+
+function doctorVerdict() {
+  if (checks.some(c => c.status === 'fail')) return 'fail';
+  if (checks.some(c => c.status === 'warn')) return 'warn';
+  return 'ok';
+}
+
+function checkPath(name, target, options = {}) {
+  let stat;
+  try { stat = fs.statSync(target); } catch (_) {}
+  if (!stat) {
+    add(options.required ? 'fail' : 'warn', name, `${shortPath(target)} missing`);
+    return;
+  }
+  if (options.dir && !stat.isDirectory()) {
+    add('fail', name, `${shortPath(target)} exists but is not a directory`);
+    return;
+  }
+  if (options.privateMode) {
+    const mode = stat.mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      add('warn', name, `${shortPath(target)} permissions ${mode.toString(8)}; expected owner-only`);
+      return;
+    }
+  }
+  add('ok', name, shortPath(target));
+}
+
+function checkLaneSnapshot(provider, captureWarnMinutes, hint) {
+  const file = readFirst([path.join(STATE_DIR, `${provider}-usage.json`)]);
+  if (!file.value) {
+    add('warn', `${provider} snapshot`, `no ${provider}-usage.json; lane is invisible to the HUD`);
+    return;
+  }
+  const snap = file.value;
+  const captured = snap.capturedAt || snap.updatedAt;
+  const event = snap.eventAt || snap.updatedAt;
+  const capturedDate = captured ? new Date(captured) : null;
+  const capturedValid = capturedDate && !Number.isNaN(capturedDate.getTime()) && capturedDate.getTime() <= Date.now();
+  const capturedStale = capturedValid && Date.now() - capturedDate.getTime() > captureWarnMinutes * 60 * 1000;
+  add(!capturedValid || capturedStale ? 'warn' : 'ok', `${provider} snapshot`,
+    `${shortPath(file.path)} · checked ${ageText(captured)} · event ${ageText(event)}${!capturedValid ? ' (no valid capture stamp)' : capturedStale ? ` (${hint})` : ''}`);
+  checkLaneHealth(provider, snap);
+  checkWindowContract(provider, snap);
+}
+
+function checkLaneHealth(provider, snapshot) {
+  const health = snapshot && snapshot.health;
+  if (!health || typeof health !== 'object') {
+    if (Number(snapshot?.schemaVersion || 1) >= 2) {
+      add('warn', `${provider} health`, 'schema v2 snapshot has no health verdict');
+    }
+    return;
+  }
+
+  const verdict = String(health.verdict || '').trim().toLowerCase();
+  const reason = health.reason ? ` · ${String(health.reason).slice(0, 180)}` : '';
+  const checked = health.checkedAt ? ` · checked ${ageText(health.checkedAt)}` : '';
+  if (['fresh', 'ok', 'healthy'].includes(verdict)) {
+    add('ok', `${provider} health`, `${verdict}${checked}`);
+  } else if (['broken', 'unauthorized', 'invalid'].includes(verdict)) {
+    add('fail', `${provider} health`, `${verdict}${reason}${checked}`);
+  } else if (['stale', 'degraded'].includes(verdict)) {
+    add('warn', `${provider} health`, `${verdict}${reason}${checked}`);
+  } else {
+    add('warn', `${provider} health`, `${verdict || 'missing verdict'}${reason}${checked}`);
+  }
+}
+
+function checkWindowContract(provider, snapshot) {
+  const windows = snapshot && snapshot.windows;
+  if (!Array.isArray(windows)) {
+    if (Number(snapshot?.schemaVersion || 1) >= 2) {
+      add('fail', `${provider} windows`, 'schema v2 snapshot has no windows array');
+    }
+    return;
+  }
+  if (windows.length === 0) {
+    add(Number(snapshot?.schemaVersion || 1) >= 2 ? 'warn' : 'ok', `${provider} windows`, 'no declared windows');
+    return;
+  }
+
+  let failed = false;
+  let warned = false;
+  const summary = [];
+  for (let index = 0; index < windows.length; index += 1) {
+    const window = windows[index] || {};
+    const id = String(window.id || `#${index + 1}`);
+    const state = String(window.state || '').trim().toLowerCase();
+    const reset = window.resetAt ? new Date(window.resetAt) : null;
+    const validReset = reset && !Number.isNaN(reset.getTime());
+    const resetPast = validReset && reset.getTime() <= Date.now();
+    if (!window.id) failed = true;
+    if (!['live', 'expired', 'unknown'].includes(state)) failed = true;
+    if (state === 'live') {
+      if (typeof window.usedPct !== 'number' || !Number.isFinite(window.usedPct)) warned = true;
+      if (!validReset) warned = true;
+      if (resetPast) failed = true;
+    } else if (state === 'expired') {
+      if (!validReset || !resetPast) warned = true;
+    } else if (state === 'unknown') {
+      warned = true;
+    }
+    summary.push(`${id}:${state || 'missing'}${validReset ? (resetPast ? '/reset-past' : '/reset-future') : '/reset-unknown'}`);
+  }
+
+  add(failed ? 'fail' : warned ? 'warn' : 'ok', `${provider} windows`, summary.slice(0, 6).join(' · '));
+}
+
+// officialUsage.source is "api" (default usage-endpoint read) or "pty" (the
+// explicit --mode pty fallback scrape); both are accepted at face value. A
+// PTY-produced snapshot from before this field existed carries no source key
+// at all, which is a legacy shape rather than a broken one, so it gets its
+// own label instead of a bare "unknown".
+function officialSourceLabel(officialUsage) {
+  const raw = officialUsage && officialUsage.source;
+  if (raw === undefined || raw === null || raw === '') return 'unknown (legacy reading)';
+  return String(raw);
+}
+
+// Combines the writer's terminal status (claude-official-status.json) with
+// the age of the officialUsage reading it produced (claude-usage.json). A
+// status of "ok" is not enough on its own: a keepalive that stalled hours
+// ago still leaves status "ok" from its last successful run, so freshness
+// is graded separately and named ("official reading aging...") rather than
+// silently trusted.
+function checkClaudeOfficialUsage() {
+  const statusFile = readFirst([path.join(STATE_DIR, 'claude-official-status.json')]);
+  if (!statusFile.value) return;
+
+  const usageFile = readFirst([path.join(STATE_DIR, 'claude-usage.json')]);
+  const officialUsage = (usageFile.value && usageFile.value.officialUsage) || {};
+  const source = officialSourceLabel(officialUsage);
+
+  const status = String(statusFile.value.status || 'unknown').trim().toLowerCase();
+  const message = String(statusFile.value.message || '').trim();
+  const updatedAt = statusFile.value.updatedAt;
+  const exitCode = Number(statusFile.value.exitCode);
+  const hasExitCode = statusFile.value.exitCode !== undefined && statusFile.value.exitCode !== null && Number.isFinite(exitCode);
+  const signal = String(statusFile.value.signal || '').trim();
+  const terminated = (hasExitCode && exitCode !== 0) || Boolean(signal);
+  const terminationDetail = signal ? `signal ${signal}` : hasExitCode ? `exit ${exitCode}` : '';
+
+  const captured = officialUsage.capturedAt ? new Date(officialUsage.capturedAt) : null;
+  const capturedValid = captured && !Number.isNaN(captured.getTime());
+  const ageMinutes = capturedValid ? (Date.now() - captured.getTime()) / 60000 : null;
+  const aging = ageMinutes !== null && ageMinutes > 30;
+
+  // The remedy for unauthorized/no_credential lives in the writer's own
+  // message field (e.g. "open Claude Code once to refresh the token"); the
+  // doctor surfaces it rather than inventing separate advice.
+  const FAIL_STATUSES = ['unauthorized', 'no_credential', 'token_expired', 'failed', 'error', 'broken'];
+  const WARN_STATUSES = ['rate_limited', 'offline', 'unparsed', 'aborted', 'unsettled'];
+
+  if (FAIL_STATUSES.includes(status)) {
+    add('fail', 'claude official /usage',
+      [status, message, `checked ${ageText(updatedAt)}`].filter(Boolean).join(' · '));
+    return;
+  }
+
+  if (WARN_STATUSES.includes(status)) {
+    add('warn', 'claude official /usage',
+      [status, message, `source ${source}`, `checked ${ageText(updatedAt)}`, claudeRetryDetail(statusFile.value)].filter(Boolean).join(' · '));
+    return;
+  }
+
+  if (status === 'ok') {
+    if (terminated) {
+      add('warn', 'claude official /usage',
+        [status, `source ${source}`, terminationDetail, `checked ${ageText(updatedAt)}`].filter(Boolean).join(' · '));
+      return;
+    }
+    if (!capturedValid) {
+      add('warn', 'claude official /usage',
+        [status, `source ${source}`, 'no officialUsage capture stamp', `checked ${ageText(updatedAt)}`].filter(Boolean).join(' · '));
+      return;
+    }
+    if (aging) {
+      add('warn', 'claude official /usage',
+        [status, `source ${source}`, `reading ${ageText(officialUsage.capturedAt)}`, 'official reading aging, keepalive refetches every 5 min'].join(' · '));
+      return;
+    }
+    add('ok', 'claude official /usage',
+      [status, `source ${source}`, `reading ${ageText(officialUsage.capturedAt)}`].join(' · '));
+    return;
+  }
+
+  // Unrecognized status: never default to ok on a value the doctor has not
+  // been taught to trust.
+  add('warn', 'claude official /usage',
+    [status || 'unknown status', message, `source ${source}`, `checked ${ageText(updatedAt)}`].filter(Boolean).join(' · '));
+}
+
+function claudeRetryDetail(status) {
+  if (String(status && status.status).toLowerCase() !== 'rate_limited') return '';
+  const retryAt = new Date(status.retryAt || '');
+  if (Number.isFinite(retryAt.getTime()) && retryAt.getTime() > Date.now()) {
+    const minutes = Math.max(1, Math.ceil((retryAt.getTime() - Date.now()) / 60000));
+    return `automatic retry in about ${minutes} min; no sign-in or setup change needed`;
+  }
+  return 'last check was rate-limited; keep Usage HUD open for automatic retries; run diagnostics again if readings stay old';
+}
+
+// The fetch script resolves python3 through /usr/bin/env, and a LaunchAgent's
+// login shell runs path_helper, which put a python.org build with an EMPTY CA
+// store ahead of Homebrew on this Mac: every HTTPS call failed
+// CERTIFICATE_VERIFY_FAILED and the status file said only "unreachable"
+// (2026-09-10 to 09-12). The fetch now falls back to /etc/ssl/cert.pem; this
+// check names the interpreter a login shell picks so the fallback is visible.
+function checkClaudeFetchInterpreter() {
+  const run = (file, args) => {
+    try {
+      return execFileSync(file, args, { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    } catch (_) {
+      return null;
+    }
+  };
+  const resolved = run('/bin/bash', ['-lc', 'command -v python3']);
+  if (!resolved) {
+    add('fail', 'claude fetch interpreter', 'python3 not found on a login-shell PATH; the official fetch cannot run from launchd');
+    return;
+  }
+  const probe = run(resolved, ['-c', 'import ssl;print(ssl.create_default_context().cert_store_stats()["x509_ca"])']);
+  const caCount = probe === null ? null : Number(probe);
+  const systemBundle = fs.existsSync('/etc/ssl/cert.pem');
+  if (caCount === null || !Number.isFinite(caCount)) {
+    add('warn', 'claude fetch interpreter', `${resolved} · could not probe its TLS trust store`);
+    return;
+  }
+  if (caCount > 0) {
+    add('ok', 'claude fetch interpreter', `${resolved} · ${caCount} CA certs`);
+    return;
+  }
+  if (systemBundle) {
+    add('ok', 'claude fetch interpreter', `${resolved} · empty CA store, fetch trusts /etc/ssl/cert.pem instead`);
+    return;
+  }
+  add('fail', 'claude fetch interpreter', `${resolved} · empty CA store and no /etc/ssl/cert.pem; HTTPS to the usage endpoint cannot verify`);
+}
+
+function checkFableWeekly() {
+  const file = readFirst([path.join(STATE_DIR, 'claude-usage.json')]);
+  const fable = file.value && file.value.weekFable;
+  if (!fable) return; // no reading yet; the official fetch hasn't run since the parser learned Fable
+
+  const source = officialSourceLabel(file.value.officialUsage);
+  const captured = fable.capturedAt ? new Date(fable.capturedAt) : null;
+  const validDate = captured && !Number.isNaN(captured.getTime());
+  const stale = !validDate || Date.now() - captured.getTime() > 30 * 60 * 1000;
+
+  const statusFile = readFirst([path.join(STATE_DIR, 'claude-official-status.json')]);
+  const officialStatus = String((statusFile.value && statusFile.value.status) || '').trim().toLowerCase();
+  const needsCredentialFix = ['unauthorized', 'no_credential', 'token_expired'].includes(officialStatus);
+
+  const detail = [
+    fable.usedPct != null ? `${fable.usedPct}% used` : 'no percentage',
+    `source ${source}`,
+    validDate ? `captured ${ageText(fable.capturedAt)}` : 'no capture stamp',
+    stale ? (needsCredentialFix ? 'open Claude Code and sign in, then choose Refresh in Usage HUD' :
+      claudeRetryDetail(statusFile.value) || 'official reading aging, keepalive refetches every 5 min') : ''
+  ].filter(Boolean).join(' · ');
+  add(stale ? 'warn' : 'ok', 'fable weekly reading', detail);
+}
+
+// claude-usage.json is schema v1: currentSession/week/weekFable objects, each
+// shaped {label, usedPct, resetLabel, resetAt, eventAt?, capturedAt?}. It
+// never carries a windows[] array (that is the v2 shape checkWindowContract
+// handles for other providers), so the Claude lane needs its own contract
+// check. Claude Code drops a rate-limit window the instant its resetAt
+// passes, so a window that still reports a used percentage past that point
+// did not refresh: that is a stale value wearing a live label, not a live
+// reading.
+function checkClaudeWindowContract() {
+  const file = readFirst([path.join(STATE_DIR, 'claude-usage.json')]);
+  const snapshot = file.value || {};
+  const WINDOW_KEYS = [
+    { key: 'currentSession', label: '5h' },
+    { key: 'week', label: 'week' },
+    { key: 'weekFable', label: 'Fable' }
+  ];
+
+  const present = WINDOW_KEYS
+    .map(spec => ({ ...spec, window: snapshot[spec.key] }))
+    .filter(spec => spec.window && typeof spec.window === 'object'
+      && typeof spec.window.usedPct === 'number' && Number.isFinite(spec.window.usedPct));
+
+  if (present.length === 0) {
+    add('warn', 'claude windows', 'no Claude windows in snapshot (rollover gap or dead tap)');
+    return;
+  }
+
+  const summary = [];
+  let sawMissingReset = false;
+  let sawPastReset = false;
+  let newestEventMs = null;
+
+  for (const { key, label, window } of present) {
+    const pct = Math.round(window.usedPct);
+    const reset = window.resetAt ? new Date(window.resetAt) : null;
+    const validReset = reset && !Number.isNaN(reset.getTime());
+    const pastByMs = validReset ? Date.now() - reset.getTime() : null;
+    const resetStalePast = pastByMs !== null && pastByMs > 5 * 60 * 1000;
+
+    if (!validReset) {
+      sawMissingReset = true;
+      summary.push(`${label} ${pct}% resetAt missing or unparsable`);
+    } else if (resetStalePast) {
+      sawPastReset = true;
+      summary.push(`${label} ${pct}% resetAt ${ageText(window.resetAt)}`);
+    } else if (key === 'weekFable') {
+      summary.push(`${label} ${pct}%`);
+    } else {
+      summary.push(`${label} ${pct}% resets ${ageText(window.resetAt, { future: true })}`);
+    }
+
+    for (const value of [window.eventAt, snapshot.eventAt]) {
+      if (!value) continue;
+      const eventDate = new Date(value);
+      if (Number.isNaN(eventDate.getTime())) continue;
+      if (newestEventMs === null || eventDate.getTime() > newestEventMs) newestEventMs = eventDate.getTime();
+    }
+  }
+
+  const summaryText = summary.join(' · ');
+  if (sawMissingReset || sawPastReset) {
+    // Name the fault that actually fired. The two failures have different
+    // repairs: a percentage with no usable resetAt means the writer never
+    // parsed a reset line, while a percentage past its reset means the
+    // refresh loop stopped.
+    const reasons = [];
+    if (sawPastReset) reasons.push('a live window past its reset is a stale value wearing a live label');
+    if (sawMissingReset) reasons.push('a window with a percentage but no usable resetAt cannot be aged');
+    add('fail', 'claude windows', `${reasons.join(' · ')} · ${summaryText}`);
+    return;
+  }
+
+  const eventStale = newestEventMs === null || Date.now() - newestEventMs > 6 * 60 * 60 * 1000;
+  if (eventStale) {
+    const eventDetail = newestEventMs === null ? 'no eventAt on any window or snapshot' : `newest event ${ageText(newestEventMs)}`;
+    add('warn', 'claude windows', `${summaryText} · ${eventDetail} (older than 6h)`);
+    return;
+  }
+
+  add('ok', 'claude windows', summaryText);
+}
+
+function checkClaudeStatuslineTap() {
+  const file = readFirst([path.join(STATE_DIR, 'claude-statusline-tap.json')]);
+  if (!file.value) {
+    const settings = readClaudeSettings();
+    const command = settings.value && settings.value.statusLine && settings.value.statusLine.command;
+    if (statuslineUsesHUDTap(command)) {
+      add('warn', 'claude statusline tap', 'configured but no heartbeat yet; open/use Claude Code once to verify statusline telemetry');
+    } else {
+      add('ok', 'claude statusline tap', 'optional integration not detected; official usage refresh does not require a statusline tap');
+    }
+    return;
+  }
+
+  const st = file.value;
+  const updated = st.updatedAt ? new Date(st.updatedAt) : null;
+  const updatedValid = updated && !Number.isNaN(updated.getTime());
+  const ageMs = updatedValid ? Date.now() - updated.getTime() : null;
+  const stale = ageMs !== null && ageMs > 24 * 60 * 60 * 1000;
+  const sawWindows = Boolean(st.hasFiveHour || st.hasSevenDay);
+  // Claude Code drops both rate-limit windows for a few minutes right at
+  // reset; that is expected and not worth a warning. Only a heartbeat that
+  // has been reporting no windows for a long stretch (the tap itself has
+  // gone stale while still empty-handed) points at a real break.
+  const windowsMissingPersisted = !sawWindows && (ageMs === null || ageMs > 6 * 60 * 60 * 1000);
+  const detail = [
+    `checked ${ageText(st.updatedAt)}`,
+    st.parsed ? 'json ok' : 'json parse failed',
+    sawWindows
+      ? 'rate windows present'
+      : windowsMissingPersisted
+        ? 'no rate windows for over 6h (Claude Code drops windows only briefly at reset)'
+        : 'no rate windows in statusline payload',
+    st.wroteSnapshot ? 'wrote snapshot' : ''
+  ].filter(Boolean).join(' · ');
+
+  // Claude statusline payloads are allowed to omit rate windows briefly
+  // because exact caps come from the official /usage path. Heartbeat
+  // parse/freshness and a persisted windows-missing gap are the contract here.
+  add(stale || !st.parsed || windowsMissingPersisted ? 'warn' : 'ok', 'claude statusline tap', detail);
+}
+
+function classifyNodeInvocation(command) {
+  const trimmed = String(command || '').trim();
+  if (/\bbloom-node\b/.test(trimmed)) return { ok: true, kind: 'bloom-node' };
+  if (/^"?\/[^"\s]*\/node"?(\s|$)/.test(trimmed)) return { ok: true, kind: 'absolute node path' };
+  if (/^"?node"?(\s|$)/.test(trimmed)) return { ok: false, kind: 'bare node' };
+  return { ok: false, kind: 'unrecognized invocation' };
+}
+
+function extractCommandArgs(command) {
+  const quoted = Array.from(String(command || '').matchAll(/"([^"]+)"/g)).map(m => m[1]);
+  if (quoted.length) return quoted;
+  return String(command || '').trim().split(/\s+/).filter(Boolean);
+}
+
+function resolveHomePath(p) {
+  if (!p) return p;
+  if (p === '~') return HOME;
+  if (p.startsWith('~/')) return path.join(HOME, p.slice(2));
+  if (p.startsWith('$HOME/')) return path.join(HOME, p.slice(6));
+  if (p.startsWith('${HOME}/')) return path.join(HOME, p.slice(8));
+  return p;
+}
+
+// An existing shell status line belongs to the user. Inspect simple script
+// paths only to recognize wrappers around our optional tap; never execute a
+// configured command or require every status line to be a Node program.
+function statuslineUsesHUDTap(command) {
+  if (String(command || '').includes('bloom-usage-statusline-tap')) return true;
+  for (const arg of extractCommandArgs(command)) {
+    const candidate = resolveHomePath(arg.replace(/^'|'$/g, ''));
+    if (!path.isAbsolute(candidate)) continue;
+    try {
+      const stat = fs.statSync(candidate);
+      if (stat.isFile() && stat.size <= 65536 && fs.readFileSync(candidate, 'utf8').includes('bloom-usage-statusline-tap')) return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+// Shared PATH-safety check for a `node <script>`-style command. The
+// statusline command and the budget-guard PreToolUse hook both broke the
+// same way this week: a session launched with a minimal PATH (launchd jobs,
+// child sessions) has no `node`, so a bare "node ..." command silently loses
+// the statusline and the guard. Both are checked with this one rule.
+function checkNodeCommand(name, command, minimalPathHint) {
+  if (!command) {
+    add('warn', name, 'no command configured');
+    return;
+  }
+  const classification = classifyNodeInvocation(command);
+  const args = extractCommandArgs(command);
+  const scriptPath = args.length ? resolveHomePath(args[args.length - 1]) : null;
+  const scriptExists = Boolean(scriptPath && fs.existsSync(scriptPath));
+
+  if (classification.ok) {
+    if (scriptExists) {
+      add('ok', name, `${classification.kind} · ${shortPath(scriptPath)}`);
+    } else {
+      add('warn', name, `${classification.kind} but script missing: ${scriptPath ? shortPath(scriptPath) : 'no script path found in command'}`);
+    }
+    return;
+  }
+
+  if (classification.kind === 'bare node') {
+    add('warn', name, minimalPathHint);
+    return;
+  }
+
+  add('warn', name, `command does not resolve to bloom-node or an absolute node path: ${trimmedForDisplay(command)}`);
+}
+
+function trimmedForDisplay(value) {
+  const text = String(value || '');
+  return text.length > 160 ? `${text.slice(0, 160)}…` : text;
+}
+
+function readClaudeSettings() {
+  const settingsPath = path.join(HOME, '.claude', 'settings.json');
+  try {
+    return { path: settingsPath, value: JSON.parse(fs.readFileSync(settingsPath, 'utf8')) };
+  } catch (_) {
+    return { path: settingsPath, value: null };
+  }
+}
+
+function checkClaudeStatuslineCommand() {
+  const settings = readClaudeSettings();
+  if (!settings.value) {
+    if (!fs.existsSync(settings.path)) {
+      add('ok', 'claude statusline command', 'optional integration not configured; official usage refresh does not require it');
+    } else {
+      add('warn', 'claude statusline command', `${shortPath(settings.path)} unparsable; cannot verify optional statusline wiring`);
+    }
+    return;
+  }
+  const command = settings.value.statusLine && settings.value.statusLine.command;
+  if (!command) {
+    add('ok', 'claude statusline command', 'optional statusline tap not set up; the Claude lane still updates from the usage endpoint (INSTALL.md step 7 adds live readings)');
+    return;
+  }
+  if (!statuslineUsesHUDTap(command)) {
+    add('ok', 'claude statusline command', 'custom status line; Usage HUD does not require it to use Node or its optional tap');
+    return;
+  }
+  if (classifyNodeInvocation(command).kind === 'unrecognized invocation') {
+    const args = extractCommandArgs(command);
+    const script = args.length === 1 ? resolveHomePath(args[0].replace(/^'|'$/g, '')) : null;
+    if (script && path.isAbsolute(script) && !fs.existsSync(script)) {
+      add('warn', 'claude statusline command', 'configured HUD tap script is missing; see INSTALL.md step 7');
+    } else {
+      add('ok', 'claude statusline command', 'HUD tap configured through a script; heartbeat check verifies delivery');
+    }
+    return;
+  }
+  checkNodeCommand(
+    'claude statusline command',
+    command,
+    'node resolves through PATH; sessions launched with a minimal PATH lose the statusline and the HUD tap; use an absolute node path (for example /opt/homebrew/bin/node) in statusLine.command in ~/.claude/settings.json'
+  );
+}
+
+// The budget-guard PreToolUse hook is an optional, hand-wired automation
+// (it pauses agent spawns when the budget is tight) -- INSTALL.md never asks a
+// user to configure it, so a fresh install with no PreToolUse hook at all
+// is not a finding. Only report on a hook that is actually wired in,
+// mirroring the rule that a missing file is not a finding.
+function findBudgetGuardHookCommand(settings) {
+  if (!settings || !settings.value) return null;
+  const groups = (settings.value.hooks && settings.value.hooks.PreToolUse) || [];
+  for (const group of groups) {
+    for (const hook of (group && group.hooks) || []) {
+      if (hook && typeof hook.command === 'string' && hook.command.includes('bloom-budget-guard.js')) {
+        return hook.command;
+      }
+    }
+  }
+  return null;
+}
+
+function checkClaudeBudgetGuardHook() {
+  const command = findBudgetGuardHookCommand(readClaudeSettings());
+  if (!command) return; // not configured; this automation is opt-in, so silence is correct
+  checkNodeCommand(
+    'claude budget guard hook',
+    command,
+    "node resolves through PATH; sessions launched with a minimal PATH lose the budget guard; point the PreToolUse hook's command in ~/.claude/settings.json at ~/.local/bin/bloom-node"
+  );
+}
+
+// The keepalive writer's crash last month (ReferenceError, silent for a
+// stretch in August) went unnoticed because nothing read its error log.
+// A log is only worth a warning while it is both non-empty and recent.
+// An old error from a fixed bug should not page anyone forever.
+function checkWriterErrorLog(name, filename) {
+  const file = path.join(HOME, 'Library', 'Application Support', 'Codex Usage HUD', 'logs', filename);
+  // The folder on disk keeps its old name; the product is called Usage HUD.
+  const shownLog = `Usage HUD logs/${filename}`;
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch (_) {
+    add('ok', name, `${shownLog} not present`);
+    return;
+  }
+  if (!stat.isFile() || stat.size === 0) {
+    add('ok', name, `${shownLog} empty`);
+    return;
+  }
+  const recent = Date.now() - stat.mtimeMs <= 24 * 60 * 60 * 1000;
+  if (!recent) {
+    add('ok', name, `${shownLog} has old errors from ${ageText(stat.mtimeMs)}; nothing recent`);
+    return;
+  }
+  const tail = readTail(file, 8192);
+  const lines = tail.split('\n').map(line => line.trim()).filter(Boolean);
+  // Redact before truncation so a token crossing the quote limit cannot leak
+  // its prefix. Preserve the surrounding diagnostic text.
+  const lastLine = (lines.length ? lines[lines.length - 1] : '')
+    .replace(/(\bBearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, '$1[redacted]')
+    .replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(/\b[0-9a-f]{32,}\b/gi, '[redacted]');
+  const quoted = lastLine.length > 120 ? `${lastLine.slice(0, 120)}…` : lastLine;
+  add('warn', name, `errors ${ageText(stat.mtimeMs)} · "${quoted}"`);
+}
+
+// bloom-budget-guard.js fails closed on an unknown mode, but "unknown" during
+// a rate-limit rollover (Claude Code drops a window the instant its resets_at
+// passes) is not the same failure as a dead pipeline. The doctor reports both
+// signals so it is obvious which case applies without reading the guard's code.
+function checkClaudeBudgetMode() {
+  // Same opt-in gate as checkClaudeBudgetGuardHook: no configured hook means
+  // this automation was never turned on, so token-budget-state.json is
+  // expected to be absent -- that is not a finding for a buyer install.
+  if (!findBudgetGuardHookCommand(readClaudeSettings())) return;
+  const file = readFirst([path.join(STATE_DIR, 'token-budget-state.json')]);
+  if (!file.value) {
+    add('fail', 'claude budget mode', 'no token-budget-state.json; bloom-budget-guard.js fails closed on unknown');
+    return;
+  }
+
+  const state = file.value;
+  const mode = String(state.mode || '').trim().toLowerCase();
+  const weeklyNumber = Number(state.weeklyUsedPct);
+  const weekly = Number.isFinite(weeklyNumber) ? `${Math.round(weeklyNumber)}% weekly` : 'weekly unknown';
+  const stateAge = state.updatedAt ? ageText(state.updatedAt) : 'no update stamp';
+
+  if (['green', 'yellow'].includes(mode)) {
+    add('ok', 'claude budget mode', `${mode} · ${weekly} · updated ${stateAge}`);
+    return;
+  }
+  if (['orange', 'red', 'freeze'].includes(mode)) {
+    add('warn', 'claude budget mode', `${mode} · ${weekly} · updated ${stateAge}`);
+    return;
+  }
+
+  const tapFile = readFirst([path.join(STATE_DIR, 'claude-statusline-tap.json')]);
+  const tapAge = tapFile.value && tapFile.value.updatedAt ? ageText(tapFile.value.updatedAt) : 'no heartbeat';
+  add('warn', 'claude budget mode',
+    `unknown · state ${stateAge} · tap heartbeat ${tapAge} · rollover gap; guard allows agents while the tap is fresh`);
+}
+
+function checkLaunchAgent(label) {
+  const isApp = label === 'com.codexusagehud.app';
+  try {
+    const out = execFileSync('launchctl', ['print', `gui/${process.getuid()}/${label}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const state = (out.match(/\bstate = ([^\n]+)/) || [])[1] || 'unknown';
+    const runs = (out.match(/\bruns = ([^\n]+)/) || [])[1] || 'unknown';
+    if (isApp && !state.includes('running')) {
+      const pid = runningAppPid();
+      if (pid) {
+        add('ok', label, `running (pid ${pid}); the old LaunchAgent plist is idle`);
+        return;
+      }
+    }
+    add(state.includes('running') || !isApp ? 'ok' : 'fail', label, `${state.trim()} · runs ${runs.trim()}`);
+  } catch (_) {
+    if (isApp) {
+      // Since 1.3.0 the app registers itself as a macOS login item
+      // (SMAppService), so there is no LaunchAgent plist to print. A
+      // running app process is the proof that matters.
+      const pid = runningAppPid();
+      if (pid) {
+        add('ok', label, `running (pid ${pid})`);
+      } else {
+        add('fail', label, 'Usage HUD is not running; open it from Applications');
+      }
+      return;
+    }
+    add('warn', label, 'not loaded in launchd');
+  }
+}
+
+function runningAppPid() {
+  try {
+    // macOS excludes ancestors by default. When Settings launches this check,
+    // the running HUD is our ancestor and must be included in the result.
+    const out = execFileSync('/usr/bin/pgrep', ['-a', '-x', 'CodexUsageHUD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const pid = out.trim().split('\n').filter(Boolean)[0];
+    return pid ? Number(pid) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function checkOptionalLaunchAgent(label, disabledDetail) {
+  try {
+    const out = execFileSync('launchctl', ['print', `gui/${process.getuid()}/${label}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const state = (out.match(/\bstate = ([^\n]+)/) || [])[1] || 'unknown';
+    const runs = (out.match(/\bruns = ([^\n]+)/) || [])[1] || 'unknown';
+    add('ok', label, `${state.trim()} · runs ${runs.trim()}`);
+  } catch (_) {
+    add('ok', label, `disabled · ${disabledDetail}`);
+  }
+}
+
+function newestJSONLFiles(root) {
+  const out = [];
+  walk(root, out);
+  return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+function walk(dir, out) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(file, out);
+    if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      try { out.push({ file, mtimeMs: fs.statSync(file).mtimeMs }); } catch (_) {}
+    }
+  }
+}
+
+function findNewestRateLimit(files) {
+  let newestCandidate = null;
+  let globalCandidate = null;
+
+  for (const item of files) {
+    if (globalCandidate && eventMillis(globalCandidate) >= item.mtimeMs) break;
+    const tail = readTail(item.file, 2 * 1024 * 1024);
+    if (!tail) continue;
+    const candidate = candidateFromTail(tail);
+    if (!candidate) continue;
+    if (isNewer(candidate.newest, newestCandidate)) newestCandidate = candidate.newest;
+    if (candidate.global && isNewer(candidate.global, globalCandidate)) globalCandidate = candidate.global;
+  }
+
+  const pick = globalCandidate || newestCandidate;
+  if (!pick) return null;
+  return {
+    timestamp: pick.event.timestamp,
+    limitId: pick.rate.limit_id,
+    rate: pick.rate
+  };
+}
+
+function candidateFromTail(tail) {
+  let newestCandidate = null;
+  let globalCandidate = null;
+
+  for (const line of tail.split('\n').reverse()) {
+    if (!line.includes('rate_limits')) continue;
+    try {
+      const event = JSON.parse(line);
+      const rate = event?.payload?.rate_limits;
+      if (!rate) continue;
+      if (!newestCandidate) newestCandidate = { event, rate };
+      if (String(rate.limit_id || '').toLowerCase() === 'codex') {
+        globalCandidate = { event, rate };
+        break;
+      }
+    } catch (_) {}
+  }
+
+  return newestCandidate ? { newest: newestCandidate, global: globalCandidate } : null;
+}
+
+function eventMillis(candidate) {
+  const ts = candidate && candidate.event && candidate.event.timestamp;
+  const millis = ts ? Date.parse(ts) : NaN;
+  return Number.isFinite(millis) ? millis : 0;
+}
+
+function isNewer(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  return eventMillis(a) > eventMillis(b);
+}
+
+function readTail(file, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const stat = fs.fstatSync(fd);
+    const length = Math.min(maxBytes, stat.size);
+    const offset = Math.max(0, stat.size - length);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, offset);
+    let text = buffer.toString('utf8');
+    if (offset > 0) {
+      const newline = text.indexOf('\n');
+      if (newline >= 0) text = text.slice(newline + 1);
+    }
+    return text;
+  } catch (_) {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+}
+
+function readFirst(paths) {
+  for (const p of paths) {
+    try { return { path: p, value: JSON.parse(fs.readFileSync(p, 'utf8')) }; } catch (_) {}
+  }
+  return { path: null, value: null };
+}
+
+function windowSummary(window) {
+  if (!window || typeof window.used_percent !== 'number') return 'window unknown';
+  const minutes = window.window_minutes ? `${window.window_minutes}m` : 'window';
+  return `${minutes} ${Math.round(window.used_percent)}%`;
+}
+
+function ageText(value, options = {}) {
+  if (!value) return 'unknown';
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return 'unknown';
+  if (options.future) {
+    const remaining = Math.max(0, Math.floor((date.getTime() - Date.now()) / 1000));
+    if (remaining < 60) return `in ${remaining}s`;
+    if (remaining < 3600) return `in ${Math.floor(remaining / 60)}m`;
+    if (remaining < 86400) return `in ${Math.floor(remaining / 3600)}h`;
+    return `in ${Math.floor(remaining / 86400)}d`;
+  }
+  const elapsed = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (elapsed < 60) return `${elapsed}s ago`;
+  if (elapsed < 3600) return `${Math.floor(elapsed / 60)}m ago`;
+  if (elapsed < 86400) return `${Math.floor(elapsed / 3600)}h ago`;
+  return `${Math.floor(elapsed / 86400)}d ago`;
+}
+
+function isOld(value) {
+  if (!value) return false;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  return Date.now() - date.getTime() > 24 * 60 * 60 * 1000;
+}
+
+function shortPath(p) {
+  if (!p) return '';
+  return p.startsWith(HOME) ? `~${p.slice(HOME.length)}` : p;
+}
+
+function add(status, name, detail) {
+  checks.push({ status, name, detail });
+}

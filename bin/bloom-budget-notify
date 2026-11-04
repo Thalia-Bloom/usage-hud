@@ -1,0 +1,155 @@
+#!/usr/bin/env node
+// Compare current token-budget mode vs last-notified mode for each provider
+// (claude, codex, gemini). Fires a macOS notification on any transition. Idempotent.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile } = require('child_process');
+
+const HOME = os.homedir();
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const PROVIDERS = [
+  { id: 'codex',        display: 'Codex',         state: 'token-budget-state-codex.json',         marker: 'token-budget-last-notified-codex.json' },
+  { id: 'claude',       display: 'Claude',        state: 'token-budget-state.json',               marker: 'token-budget-last-notified.json' },
+  { id: 'gemini',       display: 'Gemini',        state: 'token-budget-state-gemini.json',        marker: 'token-budget-last-notified-gemini.json' }
+];
+
+const RANK = { green: 0, yellow: 1, orange: 2, red: 3, freeze: 4 };
+const SHORT = { green: 'GO', yellow: 'WATCH', orange: 'SLOW', red: 'STOP', freeze: 'FREEZE' };
+const GEMINI_UNDERUSE_MIN_PCT = Number(process.env.BLOOM_GEMINI_UNDERUSE_MIN_PCT || 100);
+const GEMINI_UNDERUSE_LOOKAHEAD_HOURS = Number(process.env.BLOOM_GEMINI_UNDERUSE_LOOKAHEAD_HOURS || 6);
+const UNDERUSE_NOTIFY_COOLDOWN_HOURS = Number(process.env.BLOOM_UNDERUSE_NOTIFY_COOLDOWN_HOURS || 20);
+const NOTIFY_TIMEOUT_MS = Number(process.env.BLOOM_BUDGET_NOTIFY_TIMEOUT_MS || 5000);
+const HARD_EXIT_MS = Number(process.env.BLOOM_BUDGET_NOTIFY_HARD_EXIT_MS || 8000);
+const POLICY = read(statePath('token-budget.json')) || {};
+const UTILIZATION_TARGETS = (POLICY.usageUtilization && POLICY.usageUtilization.providerTargets) || {};
+let scheduledHardExit = null;
+
+function read(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+function statePath(file) { return path.join(STATE_DIR, file); }
+
+for (const p of PROVIDERS) {
+  const cur = read(statePath(p.state));
+  if (!cur || !cur.mode) continue;
+
+  const marker = path.join(STATE_DIR, p.marker);
+  const prev = read(marker) || {};
+  if (prev.mode === cur.mode) continue;
+
+  const direction = (RANK[cur.mode] ?? 0) > (RANK[prev.mode] ?? -1) ? 'tightened' : 'relaxed';
+  const title = `${p.display} budget · ${SHORT[cur.mode] || cur.mode.toUpperCase()}`;
+  const body = prev.mode
+    ? `Mode ${direction}: ${prev.mode} → ${cur.mode}. ${cur.modeLabel || ''} · weekly ${Math.round(cur.weeklyUsedPct ?? 0)}%`
+    : `Now ${cur.modeLabel || cur.mode} · weekly ${Math.round(cur.weeklyUsedPct ?? 0)}%`;
+  const sound = (cur.mode === 'red' || cur.mode === 'freeze') ? 'Sosumi' : 'Tink';
+
+  armHardExit();
+  execFile('osascript', ['-e', `display notification "${body.replace(/"/g, '\\"')}" with title "${title.replace(/"/g, '\\"')}" sound name "${sound}"`], { timeout: NOTIFY_TIMEOUT_MS }, (err) => {
+    if (err) return; // failed banner must not swallow the transition — retry next tick
+    fs.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(marker, JSON.stringify({ mode: cur.mode, modeLabel: cur.modeLabel, notifiedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+  });
+}
+
+maybeNotifyUnderuse();
+
+function maybeNotifyUnderuse() {
+  const providers = [
+    {
+      id: 'gemini',
+      display: 'Gemini',
+      usage: 'gemini-usage.json',
+      marker: 'gemini-underuse-last-notified.json',
+      title: 'Gemini quota on table',
+      defaultTargetPct: GEMINI_UNDERUSE_MIN_PCT,
+      defaultLookaheadHours: GEMINI_UNDERUSE_LOOKAHEAD_HOURS,
+      lane: 'research, reviews, video planning, and repo audits'
+    },
+    {
+      id: 'codex',
+      display: 'Codex',
+      usage: 'codex-usage.json',
+      marker: 'codex-underuse-last-notified.json',
+      title: 'Codex quota on table',
+      defaultTargetPct: 100,
+      defaultLookaheadHours: 24,
+      lane: 'implementation, backend hardening, tests, and repo cleanup'
+    },
+    {
+      id: 'claude',
+      display: 'Claude',
+      usage: 'claude-usage.json',
+      marker: 'claude-underuse-last-notified.json',
+      title: 'Claude quota on table',
+      defaultTargetPct: 100,
+      defaultLookaheadHours: 72,
+      lane: 'analysis, synthesis, docs, and hard reasoning; Sonnet-only is excluded'
+    }
+  ];
+
+  for (const provider of providers) maybeNotifyProviderUnderuse(provider);
+}
+
+function maybeNotifyProviderUnderuse(provider) {
+  const target = utilizationTarget(provider);
+  const usage = read(statePath(provider.usage));
+  const used = Number(usage?.week?.usedPct);
+  const resetAt = usage?.week?.resetAt ? new Date(usage.week.resetAt) : null;
+  if (!usage || !Number.isFinite(used) || !resetAt || Number.isNaN(resetAt.getTime())) return;
+
+  const hoursLeft = (resetAt.getTime() - Date.now()) / 3_600_000;
+  if (hoursLeft <= 0 || hoursLeft > target.lookaheadHours) return;
+  if (used >= target.targetPct) return;
+
+  const resetKey = resetAt.toISOString();
+  const alertKey = underuseAlertKey(provider, resetAt);
+  const marker = path.join(STATE_DIR, provider.marker);
+  const prev = read(marker) || {};
+  if (Number(prev.threshold) === target.targetPct && (prev.alertKey === alertKey || inUnderuseCooldown(prev, target))) return;
+
+  const left = Math.max(0, 100 - used);
+  const title = provider.title;
+  const body = `${Math.round(left)}% left; target ${Math.round(target.targetPct)}% before reset ${usage.week.resetLabel || resetKey}. Route ${provider.lane} here.`;
+  armHardExit();
+  execFile('osascript', ['-e', `display notification "${body.replace(/"/g, '\\"')}" with title "${title}" sound name "Tink"`], { timeout: NOTIFY_TIMEOUT_MS }, (err) => {
+    if (err) return; // failed banner must not swallow the underuse alert — retry next tick
+    fs.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(marker, JSON.stringify({
+      resetAt: resetKey,
+      alertKey,
+      threshold: target.targetPct,
+      usedPct: used,
+      notifiedAt: new Date().toISOString()
+    }, null, 2), { mode: 0o600 });
+  });
+}
+
+function utilizationTarget(provider) {
+  const configured = UTILIZATION_TARGETS[provider.id] || {};
+  const targetPct = Number(configured.targetWeeklyPct ?? provider.defaultTargetPct);
+  const lookaheadHours = Number(configured.lookaheadHours ?? provider.defaultLookaheadHours);
+  return {
+    targetPct: Number.isFinite(targetPct) ? targetPct : provider.defaultTargetPct,
+    lookaheadHours: Number.isFinite(lookaheadHours) ? lookaheadHours : provider.defaultLookaheadHours,
+    notifyCooldownHours: Number.isFinite(UNDERUSE_NOTIFY_COOLDOWN_HOURS) ? UNDERUSE_NOTIFY_COOLDOWN_HOURS : 20
+  };
+}
+
+function underuseAlertKey(provider, resetAt) {
+  // Gemini Code Assist reports a rolling reset timestamp that advances on each
+  // refresh. Key underuse alerts by reset day so a moving minute does not spam.
+  return `${provider.id}:${resetAt.toISOString().slice(0, 10)}`;
+}
+
+function inUnderuseCooldown(prev, target) {
+  const notifiedAt = prev.notifiedAt ? new Date(prev.notifiedAt) : null;
+  if (!notifiedAt || Number.isNaN(notifiedAt.getTime())) return false;
+  return Date.now() - notifiedAt.getTime() < target.notifyCooldownHours * 3_600_000;
+}
+
+function armHardExit() {
+  if (scheduledHardExit) return;
+  scheduledHardExit = setTimeout(() => process.exit(0), HARD_EXIT_MS);
+  if (typeof scheduledHardExit.unref === 'function') scheduledHardExit.unref();
+}

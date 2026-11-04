@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.codexusagehud.refresh</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>app="$1"; [ -e "$app" ] || /bin/sleep 10; if [ ! -e "$app" ]; then /bin/rm -f "$HOME/Library/LaunchAgents/$0.plist"; /bin/launchctl bootout "gui/$(/usr/bin/id -u)/$0" 2&gt;/dev/null; exit 0; fi; exec /bin/bash -lc "$2"</string>
+		<string>com.codexusagehud.refresh</string>
+		<string>%%APP_EXECUTABLE%%</string>
+		<string>exec bash "%%BIN_DIR%%/codex-usage-refresh"</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.codexusagehud.app</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>%%SUPPORT_DIR%%/logs/usage-refresh.log</string>
+	<key>StandardErrorPath</key>
+	<string>%%SUPPORT_DIR%%/logs/usage-refresh.err.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Meter refresh only. -->
+		<key>PATH</key>
+		<string>%%BIN_DIR%%:%%HOME%%/.local/bin:%%HOME%%/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>CODEX_USAGE_HUD_STATE_DIR</key>
+		<string>%%STATE_DIR%%</string>
+		<key>BLOOM_USAGE_BIN_DIR</key>
+		<string>%%BIN_DIR%%</string>
+	</dict>
+</dict>
+</plist>

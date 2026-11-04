@@ -1,0 +1,414 @@
+#!/usr/bin/env node
+// Write a Grok usage snapshot to the Usage HUD state dir.
+// Primary source: official grok CLI billing endpoint (cli-chat-proxy.grok.com)
+// using the local grok CLI OAuth token. Secondary: local session logs under
+// ~/.grok/sessions for token-volume drivers. No prompts are sent; the billing
+// endpoint is read-only.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const https = require('https');
+const { execFileSync } = require('child_process');
+
+const HOME = os.homedir();
+const GROK_HOME = process.env.GROK_HOME || path.join(HOME, '.grok');
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const OUT_PATH = process.env.BLOOM_USAGE_OUT || path.join(STATE_DIR, 'grok-usage.json');
+const BILLING_URL = 'https://cli-chat-proxy.grok.com/v1/billing?format=credits';
+const SESSION_SCAN_LIMIT = Number(process.env.BLOOM_GROK_SESSION_SCAN_LIMIT || 500);
+
+const MIN_REFRESH_MS = Number(process.env.BLOOM_GROK_MIN_REFRESH_MS || 10 * 60 * 1000);
+// The grok OIDC access token lives ~6h. When it has expired, ask the grok CLI
+// to run its own silent refresh (rotation-safe, writes auth.json atomically)
+// via a prompt-free command. Retry at most once per hour so a signed-out
+// account can't cause a refresh storm.
+const TOKEN_REFRESH_COOLDOWN_MS = Number(process.env.BLOOM_GROK_TOKEN_REFRESH_COOLDOWN_MS || 60 * 60 * 1000);
+
+main();
+
+async function main() {
+  try {
+    const capturedAt = new Date().toISOString();
+    const prev = readPrev();
+    // An auth entry (even invalid/unreadable) or prior usage/failure is setup
+    // evidence. An empty .grok directory and an explicit empty not_set_up
+    // snapshot are not. Keep this criterion aligned with detection/doctor.
+    const authPath = path.join(GROK_HOME, 'auth.json');
+    let authExists = true;
+    try { fs.lstatSync(authPath); } catch (err) { authExists = err.code !== 'ENOENT'; }
+    let priorExists = true;
+    try { fs.lstatSync(OUT_PATH); } catch (err) { priorExists = err.code !== 'ENOENT'; }
+    const neverSetUp = !authExists && !grokSessionEvidence(path.join(GROK_HOME, 'sessions'))
+      && (!priorExists || grokUnusedSnapshot(prev));
+    if (neverSetUp && !process.env.BLOOM_GROK_BILLING_JSON && !process.env.BLOOM_GROK_BILLING_FILE) {
+      writeJSON(OUT_PATH, buildSnapshot({billing: null, prior: null, local: null, capturedAt,
+        health: {verdict: 'not_set_up', checkedAt: capturedAt, reason: 'Grok is not set up. Run `grok login` to enable it.'}}));
+      return;
+    }
+    const local = scanLocalSessions();
+    const localMoved = Boolean(
+      local && local.lastActiveAt
+      && (!prev || !prev.eventAt || Date.parse(local.lastActiveAt) > Date.parse(prev.eventAt || ''))
+    );
+    const officialAgeMs = prev && prev.official && prev.official.capturedAt
+      ? Date.now() - Date.parse(prev.official.capturedAt)
+      : Infinity;
+    const billingFresh = Number.isFinite(officialAgeMs) && officialAgeMs < MIN_REFRESH_MS;
+
+    // Idle keepalive can wait. A new local session must refetch — this is how
+    // GrokBuild 0% → 1% lands instead of sitting behind the 10-minute gate.
+    let auth = readAuth();
+    if (!localMoved && billingFresh && prev?.health?.verdict === 'fresh' && auth && !auth.expired) return;
+    let billing = null;
+    let health = { verdict: 'fresh', checkedAt: capturedAt, reason: null };
+    let refreshAttemptedAt;
+    const fixture = loadBillingFixture();
+
+    if (fixture) {
+      billing = billingConfigFrom(fixture);
+    } else {
+      if (auth && auth.expired) {
+        refreshAttemptedAt = maybeRefreshToken(capturedAt);
+        if (refreshAttemptedAt === capturedAt) auth = readAuth();
+      }
+
+      if (!auth) {
+        health = { verdict: 'broken', checkedAt: capturedAt, reason: 'Grok sign-in needs repair; run `grok login`.' };
+      } else if (auth.expired) {
+        health = { verdict: 'stale', checkedAt: capturedAt, reason: 'Grok CLI token expired and silent refresh failed; run `grok login`.' };
+      } else {
+        try {
+          billing = await fetchBilling(auth.token);
+        } catch (err) {
+          // Do not include endpoint bodies or credentials in diagnostics.
+          health = { verdict: /HTTP (401|403)\b/.test(String(err?.message)) ? 'broken' : 'degraded',
+            checkedAt: capturedAt, reason: /HTTP (401|403)\b/.test(String(err?.message))
+              ? 'Grok authorization failed; run `grok login`.' : 'Grok billing request failed.' };
+        }
+      }
+    }
+
+    // If official fetch failed, fall back to the previous snapshot's official
+    // section so the panel shows last-known + age instead of a hole.
+    let prior = null;
+    if (!billing) {
+      prior = prev && prev.official && prev.official.capturedAt ? prev.official : null;
+      if (prior && health.verdict === 'fresh') {
+        health = { verdict: 'stale', checkedAt: capturedAt, reason: 'Showing last-known official billing.' };
+      }
+    }
+
+    const snapshot = buildSnapshot({ billing, prior, local, health, capturedAt });
+    if (refreshAttemptedAt) snapshot.refreshAttemptedAt = refreshAttemptedAt;
+    writeJSON(OUT_PATH, snapshot);
+  } catch (err) {
+    console.error(err && err.message ? err.message : String(err));
+    process.exitCode = 1;
+  }
+}
+
+// Metadata-only prior-use evidence: exact sessions/<project>/<session>/summary.json.
+// Bound directory entries to 500. Errors, symlinks, and overflow stay actionable;
+// empty directories and unrelated files alone do not establish prior use.
+function grokSessionEvidence(root) {
+  let remaining = 500;
+  function visit(dir, depth) {
+    let stream;
+    try {
+      stream = fs.opendirSync(dir);
+      let entry;
+      while ((entry = stream.readSync())) {
+        if (--remaining < 0) return true;
+        if (![entry.isFile(), entry.isDirectory(), entry.isSymbolicLink(), entry.isBlockDevice(),
+          entry.isCharacterDevice(), entry.isFIFO(), entry.isSocket()].some(Boolean)) return true;
+        if (depth === 2) {
+          if (entry.name === 'summary.json') return true;
+        } else if (entry.isSymbolicLink() || (entry.isDirectory() && visit(path.join(dir, entry.name), depth + 1))) {
+          return true;
+        }
+      }
+      return false;
+    } catch (err) { return err.code !== 'ENOENT'; }
+    finally { if (stream) stream.closeSync(); }
+  }
+  return visit(root, 0);
+}
+
+function grokUnusedSnapshot(snap) {
+  const quiet = snap?.health?.verdict === 'not_set_up'
+    || (snap?.health?.verdict === 'broken'
+      && snap.schemaVersion === 1 && snap.provider === 'grok'
+      && snap.source === 'grok cli billing + local sessions'
+      && snap.sourceKind === 'local_session_log' && snap.confidence === 'low'
+      && snap.health.reason === 'No grok CLI auth found (~/.grok/auth.json). Run `grok login`.');
+  return quiet && snap.official == null && snap.week == null && snap.currentSession == null
+    && snap.providerHealth == null && snap.officialUsageStatus == null && snap.extraUsage == null
+    && Array.isArray(snap.windows) && snap.windows.length === 0;
+}
+
+function readPrev() {
+  try {
+    return JSON.parse(fs.readFileSync(OUT_PATH, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+function loadBillingFixture() {
+  if (process.env.BLOOM_GROK_BILLING_JSON) {
+    try { return JSON.parse(process.env.BLOOM_GROK_BILLING_JSON); } catch (_) { return null; }
+  }
+  if (process.env.BLOOM_GROK_BILLING_FILE) {
+    try { return JSON.parse(fs.readFileSync(process.env.BLOOM_GROK_BILLING_FILE, 'utf8')); } catch (_) { return null; }
+  }
+  return null;
+}
+
+function billingConfigFrom(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  return parsed.config && typeof parsed.config === 'object' ? parsed.config : parsed;
+}
+
+function readAuth() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(GROK_HOME, 'auth.json'), 'utf8'));
+    const entry = Object.values(raw).find((v) => v && typeof v.key === 'string' && v.key.trim());
+    if (!entry) return null;
+    const expiresAt = entry.expires_at ? Date.parse(entry.expires_at) : null;
+    if (entry.expires_at && !Number.isFinite(expiresAt)) return null;
+    return { token: entry.key, expired: Number.isFinite(expiresAt) && expiresAt <= Date.now() };
+  } catch (_) {
+    return null;
+  }
+}
+
+// Returns the attempt timestamp: `capturedAt` when a refresh was run this
+// pass, the prior attempt's timestamp while inside the cooldown, undefined
+// when no grok binary is available.
+function maybeRefreshToken(capturedAt) {
+  const grokBin = path.join(GROK_HOME, 'bin', 'grok');
+  if (!fs.existsSync(grokBin)) return undefined;
+  try {
+    const prev = JSON.parse(fs.readFileSync(OUT_PATH, 'utf8'));
+    const last = prev && prev.refreshAttemptedAt ? Date.parse(prev.refreshAttemptedAt) : NaN;
+    if (Number.isFinite(last) && Date.now() - last < TOKEN_REFRESH_COOLDOWN_MS) {
+      return prev.refreshAttemptedAt;
+    }
+  } catch (_) {}
+  try {
+    // `grok models` is prompt-free and triggers the CLI's silent OIDC refresh.
+    execFileSync(grokBin, ['models'], { stdio: 'ignore', timeout: 30000 });
+  } catch (_) {}
+  return capturedAt;
+}
+
+function fetchBilling(token) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(BILLING_URL, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'x-grok-client-version': grokVersion(),
+        'User-Agent': `grok-cli/${grokVersion()}`,
+        Accept: 'application/json'
+      },
+      timeout: 15000
+    }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        try {
+          const parsed = JSON.parse(body);
+          resolve(parsed && parsed.config ? parsed.config : null);
+        } catch (err) { reject(err); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+function grokVersion() {
+  try {
+    const v = JSON.parse(fs.readFileSync(path.join(GROK_HOME, 'version.json'), 'utf8'));
+    return v.version || v.current || '0.2.93';
+  } catch (_) {
+    return '0.2.93';
+  }
+}
+
+function scanLocalSessions() {
+  const root = path.join(GROK_HOME, 'sessions');
+  const sessions = [];
+  let dirs;
+  try { dirs = fs.readdirSync(root, { withFileTypes: true }); } catch (_) { return null; }
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const projectDir = path.join(root, dir.name);
+    let entries;
+    try { entries = fs.readdirSync(projectDir, { withFileTypes: true }); } catch (_) { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const summaryPath = path.join(projectDir, entry.name, 'summary.json');
+      try {
+        const stat = fs.statSync(summaryPath);
+        sessions.push({ summaryPath, mtimeMs: stat.mtimeMs });
+      } catch (_) {}
+    }
+  }
+  sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  let todaySessions = 0;
+  let newest = null;
+  const models = new Map();
+  for (const item of sessions.slice(0, SESSION_SCAN_LIMIT)) {
+    let summary;
+    try { summary = JSON.parse(fs.readFileSync(item.summaryPath, 'utf8')); } catch (_) { continue; }
+    const activeAt = Date.parse(summary.last_active_at || summary.updated_at || '') || item.mtimeMs;
+    if (!newest || activeAt > newest.activeAt) {
+      newest = { activeAt, model: summary.current_model_id, title: summary.session_summary };
+    }
+    if (activeAt >= dayStart.getTime()) {
+      todaySessions += 1;
+      const model = summary.current_model_id || 'unknown';
+      models.set(model, (models.get(model) || 0) + 1);
+    }
+  }
+  return {
+    todaySessions,
+    lastActiveAt: newest ? isoStamp(newest.activeAt) : null,
+    lastModel: newest ? newest.model : null,
+    modelsToday: [...models.entries()].map(([name, count]) => ({ name, count }))
+  };
+}
+
+function buildSnapshot({ billing, prior, local, health, capturedAt }) {
+  const official = billing ? officialFromBilling(billing, capturedAt) : prior;
+  // Snapshot eventAt = last local session (idle signal). Window eventAt = the
+  // official billing observation so a live 0–n% reading cannot go "stale"
+  // just because the last TUI session is two days old.
+  const eventAt = (local && local.lastActiveAt) || (official && official.capturedAt) || capturedAt;
+  const windowEventAt = (official && official.capturedAt) || capturedAt;
+
+  const week = official ? {
+    label: 'Grok weekly credits',
+    usedPct: round1(official.creditUsagePercent),
+    resetAt: official.periodEnd || undefined,
+    resetLabel: official.periodEnd ? shortLabel(official.periodEnd) : undefined,
+    eventAt: windowEventAt,
+    capturedAt: official.capturedAt,
+    state: 'live'
+  } : undefined;
+
+  const skills = official
+    ? official.products.map((p) => ({ name: `Grok · ${p.product}`, percent: round1(p.usagePercent || 0) }))
+    : [];
+
+  const contributors = [];
+  if (official) {
+    for (const p of official.products) {
+      contributors.push({
+        label: p.product,
+        percent: round1(p.usagePercent || 0),
+        note: 'Share of the weekly credit budget used by this product.'
+      });
+    }
+  }
+
+  const windows = [];
+  if (week) {
+    windows.push({
+      id: 'week', label: 'Weekly credits', usedPct: week.usedPct,
+      resetAt: week.resetAt || null, eventAt: windowEventAt,
+      capturedAt: official.capturedAt, state: 'live'
+    });
+  }
+
+  return pruneUndefined({
+    schemaVersion: 1,
+    provider: 'grok',
+    displayName: 'Grok',
+    source: 'grok cli billing + local sessions',
+    sourceKind: official && billing ? 'official_api' : 'local_session_log',
+    confidence: official && billing ? 'official' : (official ? 'stale-official' : 'low'),
+    confidenceNote: official
+      ? 'Weekly GrokBuild credit usage from the grok CLI billing endpoint; session activity from local TUI logs. The SuperGrok plan meter is a separate pool.'
+      : health.verdict === 'not_set_up' ? 'Grok is not set up; run `grok login` to enable this lane.'
+        : 'No official billing reachable; local session activity only.',
+    updatedAt: capturedAt,
+    eventAt,
+    capturedAt,
+    extraUsage: [
+      official ? `Weekly credits ${round1(official.creditUsagePercent)}% used` : null,
+      local && local.todaySessions > 0
+        ? `${local.todaySessions} session${local.todaySessions === 1 ? '' : 's'} today (${local.modelsToday.map((m) => m.name).join(', ') || 'grok'})`
+        : null
+    ].filter(Boolean).join(' · ') || undefined,
+    week,
+    contributors: contributors.map(pruneUndefined),
+    skills,
+    subagents: [],
+    official,
+    windows,
+    health,
+    sourcePath: path.join(GROK_HOME, 'sessions')
+  });
+}
+
+function officialFromBilling(config, capturedAt) {
+  const period = config.currentPeriod || {};
+  return {
+    capturedAt,
+    creditUsagePercent: Number(config.creditUsagePercent || 0),
+    periodType: period.type || null,
+    periodStart: isoStamp(period.start || config.billingPeriodStart) || null,
+    periodEnd: isoStamp(period.end || config.billingPeriodEnd) || null,
+    onDemandUsed: numOrNull(config.onDemandUsed && config.onDemandUsed.val),
+    onDemandCap: numOrNull(config.onDemandCap && config.onDemandCap.val),
+    prepaidBalance: numOrNull(config.prepaidBalance && config.prepaidBalance.val),
+    products: (config.productUsage || []).map((p) => ({
+      product: p.product || 'unknown',
+      usagePercent: Number(p.usagePercent || 0)
+    }))
+  };
+}
+
+function isoStamp(value) {
+  if (value == null || value === '') return undefined;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return date.toISOString();
+}
+
+function shortLabel(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).replace(',', '');
+}
+
+function writeJSON(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, 0o600); } catch (_) {}
+}
+
+function pruneUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
+}
+
+function numOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function round1(value) {
+  return Math.round(Number(value) * 10) / 10;
+}
+
+function trim(err) {
+  return String(err && err.message ? err.message : err).slice(0, 120);
+}

@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+dist/
+__pycache__/
+*.pyc
+.wrangler/
+.claude/worktrees/

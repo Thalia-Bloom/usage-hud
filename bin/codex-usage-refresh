@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_REFRESH="$SCRIPT_DIR/bloom-budget-update"
+INSTALLED_REFRESH="${HOME}/.local/bin/bloom-budget-update"
+
+if [ -x "$LOCAL_REFRESH" ]; then
+  exec bash "$LOCAL_REFRESH" "$@"
+fi
+
+exec bash "$INSTALLED_REFRESH" "$@"

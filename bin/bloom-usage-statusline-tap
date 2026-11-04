@@ -1,0 +1,542 @@
+#!/usr/bin/env node
+// Statusline wrapper that taps Claude Code's rate_limits payload into
+// the Codex Usage HUD state dir, then forwards stdin to the real statusline
+// (bloom-statusline.js). Keeps the HUD live with zero user effort.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const HOME = os.homedir();
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const REAL_STATUSLINE = path.join(HOME, '.claude/hooks/bloom-statusline.js');
+const USAGE_PATH = path.join(STATE_DIR, 'claude-usage.json');
+const TAP_HEALTH_PATH = path.join(STATE_DIR, 'claude-statusline-tap.json');
+const OFFICIAL_FETCH_SCRIPT = process.env.BLOOM_CLAUDE_OFFICIAL_FETCH_BIN || siblingBin('bloom-usage-fetch-claude-official');
+const OFFICIAL_LAST_ATTEMPT_PATH = path.join(STATE_DIR, '.claude-official-last-attempt');
+const OFFICIAL_COOLDOWN_PATH = path.join(STATE_DIR, '.claude-official-rate-limited-until');
+const OFFICIAL_REFETCH_MIN_INTERVAL_MS = 120 * 1000;
+// An official reading (same endpoint as Claude Code's /usage panel) outranks
+// a statusline repaint for this long. Stale sessions re-render with the
+// rate_limits payload from their last response, so right after an account
+// reset they still paint the old high number; the official reading holds
+// until it is older than this, then a fresh tap may move it again.
+const OFFICIAL_AUTHORITY_MS = 10 * 60 * 1000;
+// A tap that disagrees with the reading on disk by at least this many points
+// inside the same window is either a stale repaint or a mid-window reset.
+// Either way the official endpoint is asked to arbitrate (throttled above).
+const DISAGREEMENT_REFETCH_PTS = 20;
+const BUDGET_UPDATE_PATH = siblingBin('bloom-budget-update');
+
+function siblingBin(name) {
+  const dirs = [];
+  if (process.env.BLOOM_USAGE_BIN_DIR) dirs.push(process.env.BLOOM_USAGE_BIN_DIR);
+  dirs.push(__dirname);
+  dirs.push(path.join(HOME, '.local/bin'));
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    try { if (fs.existsSync(candidate)) return candidate; } catch (_) {}
+  }
+  return path.join(HOME, '.local/bin', name);
+}
+const BUDGET_UPDATE_LAST_PATH = path.join(STATE_DIR, '.budget-update-last');
+const BUDGET_UPDATE_MIN_INTERVAL_MS = 60 * 1000;
+// A hung Claude Code stdin (rare, but seen on child sessions with a broken
+// pipe) must never hang the statusline itself: whatever arrived within this
+// window gets tapped and forwarded as-is.
+const STDIN_TIMEOUT_MS = 3000;
+
+let input = '';
+let settled = false;
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', c => (input += c));
+process.stdin.on('end', () => finish());
+const stdinTimeout = setTimeout(() => finish(), STDIN_TIMEOUT_MS);
+
+function finish() {
+  if (settled) return;
+  settled = true;
+  clearTimeout(stdinTimeout);
+  const raw = input;
+  try { tap(raw); } catch (_) { /* never break the statusline */ }
+  forward(raw);
+}
+
+function tap(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_) {
+    writeTapHealth(null, raw, null, { parsed: false });
+    return;
+  }
+  const rl = normalizeRateLimits(data);
+  writeTapHealth(data, raw, rl);
+
+  let existing = {};
+  try { existing = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8')); } catch (_) {}
+
+  // Claude Code drops a rate-limit window from the payload the moment its
+  // resets_at passes. When the payload no longer carries a window the last
+  // snapshot had, the gap needs an official refetch -- but only when the
+  // cached window is actually unusable going forward. A session whose
+  // payload never carries rate_limits at all (API-key auth, or renders
+  // before the first response) must not keep spawning a refetch every 120s
+  // for its whole life just because this one payload is silent: when the
+  // cached window's resetAt is still ahead of now, that value stays true
+  // and the keepalive's 10-minute refresh already keeps it fresh.
+  const now = new Date();
+  const droppedFiveHour = !(rl && rl.five_hour) && windowNeedsRefetch(existing.currentSession, now);
+  const droppedSevenDay = !(rl && rl.seven_day) && windowNeedsRefetch(existing.week, now);
+
+  if (!rl || (!rl.five_hour && !rl.seven_day)) {
+    if (droppedFiveHour || droppedSevenDay) maybeSpawnOfficialRefetch();
+    return;
+  }
+
+  const stamp = now.toISOString();
+  const merged = { ...existing, schemaVersion: existing.schemaVersion || 1, provider: 'claude', displayName: 'Claude Code' };
+  delete merged.officialCheckedAt; // dead field; nothing reads it
+  let disputed = false;
+  if (rl.seven_day) {
+    const result = mergeMonotonicWindow(existing.week, {
+      label: 'Current week (all models)',
+      resetAt: resetISO(rl.seven_day.resets_at),
+      resetLabel: formatResetLabel(rl.seven_day.resets_at),
+      usedPct: round1(rl.seven_day.used_percentage),
+      eventAt: stamp,
+    }, now);
+    merged.week = result.window;
+    disputed = disputed || result.disputed;
+  }
+  if (rl.five_hour) {
+    const result = mergeMonotonicWindow(existing.currentSession, {
+      label: 'Current session',
+      resetAt: resetISO(rl.five_hour.resets_at),
+      resetLabel: formatResetLabel(rl.five_hour.resets_at, true),
+      usedPct: round1(rl.five_hour.used_percentage),
+      eventAt: stamp,
+    }, now);
+    merged.currentSession = result.window;
+    disputed = disputed || result.disputed;
+  }
+  merged.source = 'claude-code-statusline-tap';
+  merged.sourceKind = 'statusline_event';
+  merged.confidence = 'high';
+  merged.confidenceNote = 'Parsed from Claude Code statusline rate-limit payload.';
+  merged.updatedAt = stamp;
+  merged.capturedAt = stamp;
+  merged.eventAt = stamp;
+  const anyExpired = expireRateLimitWindows(merged, new Date(stamp));
+
+  const dir = path.dirname(USAGE_PATH);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${USAGE_PATH}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, USAGE_PATH);
+  try { fs.chmodSync(USAGE_PATH, 0o600); } catch (_) {}
+  writeTapHealth(data, raw, rl, { wroteSnapshot: true });
+  if (disputed) maybeSpawnOfficialRefetch();
+
+  if (anyExpired || droppedFiveHour || droppedSevenDay) {
+    try { maybeSpawnOfficialRefetch(); } catch (_) {}
+  }
+
+  try { maybeSpawnBudgetUpdate(); } catch (_) {}
+}
+
+// Kicks off a background official /usage refetch so a dropped or expired
+// window closes within about a minute instead of staying blank until the
+// keepalive writer's own poll comes around. Kept as one function so the
+// keepalive package can spawn the same way.
+function maybeSpawnOfficialRefetch() {
+  try {
+    const now = Date.now();
+    const cooldownUntil = readEpochSeconds(OFFICIAL_COOLDOWN_PATH);
+    if (cooldownUntil !== null && cooldownUntil * 1000 > now) return;
+    // The statusline tap, the keepalive writer, and bloom-usage-capture.sh all
+    // throttle on this same stamp file. Throttling on the file's mtime keeps
+    // the three writers in agreement even if a reader's clock or the file's
+    // content parsing ever disagreed; the content itself stays epoch seconds
+    // for anything that wants to log or debug the last attempt time.
+    if (isStampFresh(OFFICIAL_LAST_ATTEMPT_PATH, OFFICIAL_REFETCH_MIN_INTERVAL_MS)) return;
+    if (!fs.existsSync(OFFICIAL_FETCH_SCRIPT)) return;
+    fs.mkdirSync(path.dirname(OFFICIAL_LAST_ATTEMPT_PATH), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(OFFICIAL_LAST_ATTEMPT_PATH, String(Math.floor(now / 1000)));
+    // The script resolves its own interpreter through its shebang; spawn the
+    // path directly so no python resolution is needed here.
+    const child = spawn(OFFICIAL_FETCH_SCRIPT, ['--mode', 'api'], { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_) { /* never break the statusline */ }
+}
+
+function maybeSpawnBudgetUpdate() {
+  try {
+    const now = Date.now();
+    // Same mtime-throttle contract as the official-refetch stamp above.
+    if (isStampFresh(BUDGET_UPDATE_LAST_PATH, BUDGET_UPDATE_MIN_INTERVAL_MS)) return;
+    if (!fs.existsSync(BUDGET_UPDATE_PATH)) return;
+    fs.mkdirSync(path.dirname(BUDGET_UPDATE_LAST_PATH), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(BUDGET_UPDATE_LAST_PATH, String(Math.floor(now / 1000)));
+    const nodeBin = resolveNodeBin();
+    const child = spawn(BUDGET_UPDATE_PATH, [], {
+      stdio: 'ignore',
+      detached: true,
+      env: { ...process.env, BLOOM_USAGE_NODE_BIN: nodeBin },
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_) { /* never break the statusline */ }
+}
+
+function resolveNodeBin() {
+  if (process.env.BLOOM_NODE_BIN) return process.env.BLOOM_NODE_BIN;
+  const shim = siblingBin('bloom-node');
+  try { if (fs.existsSync(shim)) return shim; } catch (_) {}
+  return process.execPath;
+}
+
+function readEpochSeconds(file) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch (_) { return null; }
+}
+
+// Throttles on the stamp file's own mtime rather than parsing its content.
+// The statusline tap, the keepalive writer, and bloom-usage-capture.sh share
+// these stamp files; reading mtime keeps all three readers in agreement even
+// if the content were ever malformed, unparsable, or written in a different
+// unit than expected.
+function isStampFresh(file, minIntervalMs) {
+  try {
+    const stat = fs.statSync(file);
+    return (Date.now() - stat.mtimeMs) < minIntervalMs;
+  } catch (_) { return false; }
+}
+
+function writeTapHealth(data, raw, rl, extra = {}) {
+  const payload = {
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    parsed: Boolean(data && typeof data === 'object'),
+    inputBytes: Buffer.byteLength(raw || '', 'utf8'),
+    topLevelKeyCount: data && typeof data === 'object' ? Object.keys(data).length : 0,
+    payloadKeys: data && typeof data === 'object' ? Object.keys(data).sort() : [],
+    hasRateLimits: Boolean(rl),
+    hasFiveHour: Boolean(rl && rl.five_hour),
+    hasSevenDay: Boolean(rl && rl.seven_day),
+    rateLimitKeys: rl && typeof rl === 'object' ? Object.keys(rl).sort() : [],
+    rateLimitWindowKeys: {
+      five_hour: rl && rl.five_hour && typeof rl.five_hour === 'object' ? Object.keys(rl.five_hour).sort() : [],
+      seven_day: rl && rl.seven_day && typeof rl.seven_day === 'object' ? Object.keys(rl.seven_day).sort() : [],
+    },
+    ...extra,
+  };
+  writeAtomicJSON(TAP_HEALTH_PATH, payload);
+}
+
+function writeAtomicJSON(target, payload) {
+  const dir = path.dirname(target);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${target}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`;
+  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, target);
+  try { fs.chmodSync(target, 0o600); } catch (_) {}
+}
+
+function round1(n) { return Math.round(Number(n) * 10) / 10; }
+
+// Usage is monotonic within one window, but the reading on disk can also be
+// wrong in either direction: an idle Claude Code session repaints the
+// rate_limits payload from its last response, which is LOWER than the live
+// number when the session has merely been idle, and HIGHER than the live
+// number right after an account reset that kept resets_at (the sticky 99%
+// weekly bar on 2026-10-04). Within one window (resetAt equal to the minute):
+//   - a lower candidate never regresses the number on disk;
+//   - a fresh official reading (< OFFICIAL_AUTHORITY_MS old) also holds
+//     against a jump of DISAGREEMENT_REFETCH_PTS or more;
+//   - any other candidate wins.
+// A disagreement of DISAGREEMENT_REFETCH_PTS or more, whichever side won,
+// is reported as disputed so the caller can ask the official endpoint.
+// A different or later resetAt is a new window: the candidate wins outright.
+function mergeMonotonicWindow(existingWindow, candidate, now) {
+  const tagged = { ...candidate, source: 'statusline' };
+  if (!existingWindow || typeof existingWindow !== 'object') return { window: tagged, disputed: false };
+  const existingMinute = resetMinute(existingWindow.resetAt);
+  const candidateMinute = resetMinute(tagged.resetAt);
+  if (
+    existingMinute === null ||
+    existingMinute !== candidateMinute ||
+    typeof existingWindow.usedPct !== 'number' ||
+    typeof tagged.usedPct !== 'number'
+  ) {
+    return { window: tagged, disputed: false };
+  }
+  const delta = tagged.usedPct - existingWindow.usedPct;
+  const disputed = Math.abs(delta) >= DISAGREEMENT_REFETCH_PTS;
+  if (delta < 0) return { window: existingWindow, disputed };
+  if (disputed && officialWindowIsFresh(existingWindow, now)) return { window: existingWindow, disputed };
+  return { window: tagged, disputed };
+}
+
+function officialWindowIsFresh(window, now) {
+  if (!window || window.source !== 'official') return false;
+  const eventAt = parseDate(window.eventAt);
+  if (!eventAt) return false;
+  const nowMs = now instanceof Date ? now.getTime() : Date.now();
+  return nowMs - eventAt.getTime() <= OFFICIAL_AUTHORITY_MS;
+}
+
+function resetMinute(resetAt) {
+  const d = parseDate(resetAt);
+  if (!d) return null;
+  return Math.floor(d.getTime() / 60000);
+}
+
+// True when a cached window can no longer be trusted to still be valid: it
+// never existed, its resetAt never parsed, or that reset has already
+// passed. False when the window is present and its resetAt is still ahead
+// of now -- a payload that simply omits the window this one time is not a
+// reason to refetch.
+function windowNeedsRefetch(window, now) {
+  if (!window || typeof window !== 'object') return true;
+  const resetAt = parseDate(window.resetAt);
+  if (!resetAt) return true;
+  return resetAt <= now;
+}
+
+function expireRateLimitWindows(snapshot, now) {
+  const expired = [];
+
+  // Fable weekly resets on the same clock as the all-models week. A weekFable
+  // whose own reset never parsed (resetAt null) must not become immortal:
+  // backfill its reset from the week window, and expire it outright when it
+  // was captured before the current weekly window began.
+  const weekResetAt = snapshot.week ? parseDate(snapshot.week.resetAt) : null;
+  const fable = snapshot.weekFable;
+  if (fable && typeof fable === 'object' && weekResetAt) {
+    if (!fable.resetAt) {
+      fable.resetAt = weekResetAt.toISOString();
+      fable.resetLabel = fable.resetLabel || snapshot.week.resetLabel || null;
+    }
+    const capturedAt = parseDate(fable.capturedAt);
+    const weekStart = new Date(weekResetAt.getTime() - 7 * 24 * 60 * 60 * 1000);
+    if (capturedAt && capturedAt < weekStart) {
+      // Push both the human sentence (for the panel's tooltip) and the bare
+      // key literal "weekFable" (FableDisplay.shouldShow in UsageView.swift
+      // checks snapshot.rateLimitExpired for that exact string).
+      expired.push(`${fable.label || 'weekFable'} captured before weekly reset`, 'weekFable');
+      delete snapshot.weekFable;
+    }
+  }
+
+  for (const key of ['currentSession', 'week', 'weekFable']) {
+    const window = snapshot[key];
+    if (!window || typeof window !== 'object' || typeof window.usedPct !== 'number') continue;
+    const resetAt = parseResetDate(window, snapshot.eventAt || snapshot.updatedAt, now);
+    if (!resetAt || resetAt > now) continue;
+    // Same dual-push: the sentence for humans, the bare key ("weekFable",
+    // "week", or "currentSession") for the Swift exact-string check.
+    expired.push(`${window.label || key} reset ${window.resetLabel || resetAt.toISOString()}`, key);
+    delete snapshot[key];
+  }
+  if (expired.length) {
+    snapshot.rateLimitExpiredAt = now.toISOString();
+    snapshot.rateLimitExpired = [...new Set(expired)];
+  }
+  return expired.length > 0;
+}
+
+function normalizeRateLimits(data) {
+  if (!data || typeof data !== 'object') return null;
+  const raw = data.rate_limits || data.rateLimits || data.usage?.rate_limits || data.usage?.rateLimits;
+  if (!raw || typeof raw !== 'object') return null;
+  const fiveHour = normalizeWindow(raw.five_hour || raw.fiveHour || raw.current_session || raw.currentSession);
+  const sevenDay = normalizeWindow(raw.seven_day || raw.sevenDay || raw.week || raw.current_week || raw.currentWeek);
+  if (!fiveHour && !sevenDay) return raw;
+  return {
+    ...raw,
+    ...(fiveHour ? { five_hour: fiveHour } : {}),
+    ...(sevenDay ? { seven_day: sevenDay } : {}),
+  };
+}
+
+function normalizeWindow(window) {
+  if (!window || typeof window !== 'object') return null;
+  return {
+    ...window,
+    used_percentage: window.used_percentage ?? window.usedPercentage ?? window.usedPct,
+    resets_at: window.resets_at ?? window.resetsAt ?? window.resetAt,
+  };
+}
+
+function parseResetDate(window, eventAt, now) {
+  const direct = parseDate(window.resetAt);
+  if (direct) return direct;
+
+  const label = String(window.resetLabel || '').trim();
+  if (!label) return null;
+
+  const dateWithMonth = parseMonthDayTime(label, now.getFullYear(), now);
+  if (dateWithMonth) return dateWithMonth;
+
+  const timeOnly = parseTimeOnly(label, now);
+  if (timeOnly) return timeOnly;
+
+  const eventDate = parseDate(eventAt);
+  if (eventDate) return parseTimeOnly(label, eventDate);
+  return null;
+}
+
+function parseTimeOnly(label, reference) {
+  const match = label.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || 0);
+  const meridiem = match[3].toUpperCase();
+  if (meridiem === 'PM' && hour !== 12) hour += 12;
+  if (meridiem === 'AM' && hour === 12) hour = 0;
+
+  const parsed = new Date(reference);
+  parsed.setHours(hour, minute, 0, 0);
+  if (parsed < reference && (reference - parsed) > 6 * 60 * 60 * 1000) {
+    parsed.setDate(parsed.getDate() + 1);
+  }
+  return parsed;
+}
+
+function parseMonthDayTime(label, year, now) {
+  const match = label.match(/^([A-Za-z]+)\s+(\d{1,2})(?:,)?\s+(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!match) return null;
+  const months = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
+    apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
+    aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9,
+    nov: 10, november: 10, dec: 11, december: 11,
+  };
+  const month = months[match[1].toLowerCase()];
+  if (month === undefined) return null;
+  let hour = Number(match[3]);
+  const minute = Number(match[4] || 0);
+  const meridiem = match[5].toUpperCase();
+  if (meridiem === 'PM' && hour !== 12) hour += 12;
+  if (meridiem === 'AM' && hour === 12) hour = 0;
+  const parsed = new Date(year, month, Number(match[2]), hour, minute, 0, 0);
+  if (parsed < now && (now - parsed) > 180 * 24 * 60 * 60 * 1000) {
+    parsed.setFullYear(year + 1);
+  }
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function newestISO(...values) {
+  const dates = values.map(parseDate).filter(Boolean);
+  if (!dates.length) return undefined;
+  return new Date(Math.max(...dates.map(date => date.getTime()))).toISOString();
+}
+
+function parseTrackerDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function parseDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatMoney(value) {
+  return Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 });
+}
+
+function formatCompact(value) {
+  return Number(value).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 });
+}
+
+function intOrUndefined(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : undefined;
+}
+
+function numberOrUndefined(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function pruneUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
+}
+
+function formatResetLabel(raw, timeOnly) {
+  if (raw == null) return null;
+  // raw may be unix seconds (number) or ISO string
+  const d = typeof raw === 'number'
+    ? new Date(raw * 1000)
+    : new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  const opts = timeOnly
+    ? { hour: 'numeric', minute: '2-digit' }
+    : { month: 'short', day: 'numeric', hour: 'numeric' };
+  return d.toLocaleString('en-US', { ...opts, timeZone: 'America/Los_Angeles' }).replace(',', '');
+}
+
+function resetISO(raw) {
+  if (raw == null) return null;
+  const d = typeof raw === 'number'
+    ? new Date(raw * 1000)
+    : new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function forward(raw) {
+  // The tap's job is best-effort enrichment; a missing or broken real
+  // statusline must never turn into a nonzero exit for Claude Code.
+  // A buyer keeps their own statusline by putting its command after the tap:
+  //   "<tap path>" -- <their previous statusLine.command>
+  const nextArgs = process.argv.slice(2);
+  if (nextArgs[0] === '--') nextArgs.shift();
+  if (nextArgs.length) {
+    const next = spawn('/bin/sh', ['-c', nextArgs.join(' ')], { stdio: ['pipe', 'inherit', 'inherit'] });
+    next.on('error', () => { printBuiltinStatusline(raw); process.exit(0); });
+    next.on('exit', code => process.exit(code || 0));
+    next.stdin.end(raw);
+    return;
+  }
+  let hasRealStatusline = false;
+  try { hasRealStatusline = fs.existsSync(REAL_STATUSLINE); } catch (_) {}
+  if (!hasRealStatusline) {
+    // A buyer who never wires statusLine.command at ~/.claude/hooks/bloom-statusline.js
+    // (INSTALL.md's optional step) would otherwise get a blank statusline
+    // forever. Print a minimal built-in line from this payload instead.
+    printBuiltinStatusline(raw);
+    process.exit(0);
+    return;
+  }
+  const child = spawn(process.execPath, [REAL_STATUSLINE], { stdio: ['pipe', 'inherit', 'inherit'] });
+  child.on('error', () => process.exit(0));
+  child.on('exit', code => process.exit(code || 0));
+  child.stdin.end(raw);
+}
+
+function printBuiltinStatusline(raw) {
+  try {
+    const data = JSON.parse(raw);
+    const model = data && data.model && (data.model.display_name || data.model.displayName || data.model.id);
+    const parts = [String(model || 'Claude')];
+    const rl = normalizeRateLimits(data);
+    if (rl && rl.five_hour && rl.five_hour.used_percentage != null) {
+      parts.push(`5h ${round1(rl.five_hour.used_percentage)}%`);
+    }
+    if (rl && rl.seven_day && rl.seven_day.used_percentage != null) {
+      parts.push(`wk ${round1(rl.seven_day.used_percentage)}%`);
+    }
+    process.stdout.write(`${parts.join(' · ')}\n`);
+  } catch (_) {
+    // No usable payload; say nothing rather than print garbage.
+  }
+}

@@ -1,0 +1,40 @@
+#!/bin/sh
+# usage-hud: run Usage HUD's built-in command line (status, room, lane, mcp,
+# prompt, schema, help) by exec'ing the app binary with the same arguments.
+#
+# Finds the binary, first match wins:
+#   1. $USAGE_HUD_BIN
+#   2. next to this script when it lives inside an app bundle
+#      (Contents/MacOS, Contents/Helpers, Contents/Resources/bin), following symlinks
+#   3. /Applications/Usage HUD.app, ~/Applications/Usage HUD.app,
+#      ~/Applications/CodexUsageHUD.app, /Applications/CodexUsageHUD.app
+# Exit 127 when no Usage HUD app is found.
+
+self=$0
+# Follow symlinks so a link in ~/.local/bin still finds its bundle.
+while [ -L "$self" ]; do
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$(dirname "$self")/$target ;;
+  esac
+done
+here=$(cd "$(dirname "$self")" 2>/dev/null && pwd)
+
+for candidate in \
+  "${USAGE_HUD_BIN:-}" \
+  "$here/CodexUsageHUD" \
+  "$here/../MacOS/CodexUsageHUD" \
+  "$here/../../MacOS/CodexUsageHUD" \
+  "/Applications/Usage HUD.app/Contents/MacOS/CodexUsageHUD" \
+  "$HOME/Applications/Usage HUD.app/Contents/MacOS/CodexUsageHUD" \
+  "$HOME/Applications/CodexUsageHUD.app/Contents/MacOS/CodexUsageHUD" \
+  "/Applications/CodexUsageHUD.app/Contents/MacOS/CodexUsageHUD"
+do
+  if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+echo "usage-hud: Usage HUD.app not found. Install it in /Applications or set USAGE_HUD_BIN." >&2
+exit 127

@@ -1,0 +1,1489 @@
+#!/usr/bin/env python3
+"""
+Fetch Claude Code's official /usage panel through a private PTY and merge it
+into the Codex Usage HUD state dir.
+
+Claude's rich plan usage currently comes from the interactive /usage panel, not
+the statusline payload. This script opens Claude Code with a pseudo-terminal,
+runs /usage, parses the displayed official percentages, writes the HUD snapshot,
+then exits without sending a model prompt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("CODEX_USAGE_HUD_STATE_DIR") or os.environ.get("BLOOM_USAGE_DIR") or HOME / ".codex-usage-hud")
+USAGE_PATH = Path(os.environ.get("BLOOM_USAGE_OUT", STATE_DIR / "claude-usage.json"))
+CAPTURE_PATH = Path(os.environ.get("BLOOM_CLAUDE_USAGE_CAPTURE", STATE_DIR / "claude-official-usage.txt"))
+OFFICIAL_STATUS_PATH = Path(os.environ.get("BLOOM_CLAUDE_USAGE_STATUS", STATE_DIR / "claude-official-status.json"))
+RATE_LIMIT_COOLDOWN_PATH = Path(os.environ.get("BLOOM_CLAUDE_USAGE_RATE_LIMIT_COOLDOWN", STATE_DIR / ".claude-official-rate-limited-until"))
+CLAUDE_BIN = os.environ.get("BLOOM_CLAUDE_BIN") or shutil.which("claude") or str(HOME / ".local/bin/claude")
+# Claude Code v2.1.x starts slower than the old 18s budget; the loop exits
+# early once the panel parses, so a generous ceiling costs nothing on fast runs.
+TIMEOUT_SECONDS = float(os.environ.get("BLOOM_CLAUDE_USAGE_TIMEOUT", "45"))
+RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("BLOOM_CLAUDE_USAGE_RATE_LIMIT_COOLDOWN_SECONDS", "1800"))
+
+# Two consecutive parses of the PTY output must agree, at least this many
+# seconds apart, before the panel is accepted as settled (see read_until_usage).
+SETTLE_INTERVAL_SECONDS = 1.5
+
+# API mode: the same endpoint Claude Code's own /usage panel reads.
+API_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+API_TIMEOUT_SECONDS = float(os.environ.get("BLOOM_CLAUDE_USAGE_API_TIMEOUT", "10"))
+KEYCHAIN_TIMEOUT_SECONDS = float(os.environ.get("BLOOM_CLAUDE_KEYCHAIN_TIMEOUT", "5"))
+# Deliberately shorter than the PTY cooldown: the API call is cheap, so retry sooner.
+API_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("BLOOM_CLAUDE_USAGE_API_RATE_LIMIT_COOLDOWN_SECONDS", "300"))
+# A durable failure (revoked token, no Keychain entry at all, network down) is
+# not a transient rate limit: retrying every ~120s would hammer the Keychain
+# and the endpoint with a request that cannot succeed until the user signs in
+# again. These share the same cooldown file the rate-limited path uses, so
+# every caller that already throttles on it backs off automatically.
+API_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("BLOOM_CLAUDE_USAGE_FAILURE_COOLDOWN_SECONDS", "600"))
+# API mode is safe to call on a fixed short loop (the claude-writer LaunchAgent
+# runs it every 60s ahead of the keepalive) because it skips when the official
+# reading is younger than this. Same env name the keepalive writer honors, so
+# the two never disagree about what "fresh" means. --force bypasses it.
+OFFICIAL_MAX_AGE_SECONDS = int(os.environ.get("BLOOM_CLAUDE_OFFICIAL_MAX_AGE_SECONDS", "300"))
+# CA bundles to trust when the interpreter's own store is empty. A python.org
+# build that never ran "Install Certificates.command" (the /usr/local/bin
+# python3 a login shell's path_helper puts ahead of Homebrew) ships with zero
+# CAs, so every HTTPS call fails CERTIFICATE_VERIFY_FAILED and used to be
+# reported as a bare "unreachable". macOS ships /etc/ssl/cert.pem.
+SYSTEM_CA_BUNDLES = ("/etc/ssl/cert.pem",)
+
+
+# SIGTERM arrives when the caller's own timeout (bloom-usage-capture.sh, the
+# live-scrape launchd job) decides this run has taken too long. Earlier this
+# raised SystemExit from inside read_until_usage's loop, which unwound past
+# process_usage entirely and left no status written at all. Setting a flag
+# instead lets the read loop end on its own terms and process_usage run to
+# completion and record an honest "aborted" status.
+_terminate_requested = False
+
+
+def request_termination(_signum: int, _frame: Any) -> None:
+    global _terminate_requested
+    _terminate_requested = True
+
+
+signal.signal(signal.SIGTERM, request_termination)
+
+
+ANSI_RE = re.compile(
+    r"""
+    \x1b
+    (?:
+      \[[0-?]*[ -/]*[@-~]
+      |\][^\x07]*(?:\x07|\x1b\\)
+      |[PX^_].*?\x1b\\
+      |[@-Z\\-_]
+    )
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def iso_z_ms(dt: datetime) -> str:
+    """Format a timestamp as ISO 8601 UTC with exactly three fractional
+    digits and a trailing Z, matching JavaScript's toISOString and the
+    format the Swift decoder's ISO8601DateFormatter(.withFractionalSeconds)
+    expects (it requires exactly three digits to parse at all).
+    """
+    dt = dt.astimezone(timezone.utc)
+    millis = dt.microsecond // 1000
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{millis:03d}Z"
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    renamed = False
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+        renamed = True
+    finally:
+        if not renamed:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    renamed = False
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+        renamed = True
+    finally:
+        if not renamed:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+
+def write_official_status(
+    status: str,
+    message: str,
+    captured_at: datetime,
+    retry_at: datetime | None = None,
+    exit_code: int | None = None,
+    cleanup_exit_code: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "schemaVersion": 1,
+        "status": status,
+        "message": message,
+        "updatedAt": iso_z_ms(captured_at),
+    }
+    if extra:
+        payload.update(extra)
+    if retry_at:
+        payload["retryAt"] = iso_z_ms(retry_at)
+    if exit_code is not None:
+        payload["exitCode"] = exit_code
+    if cleanup_exit_code is not None:
+        payload["cleanupForced"] = True
+        payload["cleanupExitCode"] = cleanup_exit_code
+    atomic_write_json(OFFICIAL_STATUS_PATH, payload)
+
+
+def set_rate_limit_cooldown(until: datetime) -> None:
+    atomic_write_text(RATE_LIMIT_COOLDOWN_PATH, str(int(until.timestamp())))
+
+
+def rate_limit_cooldown_until() -> datetime | None:
+    """The cooldown the writers and this script share, or None when clear."""
+    try:
+        raw = RATE_LIMIT_COOLDOWN_PATH.read_text().strip()
+    except OSError:
+        return None
+    try:
+        epoch = int(float(raw))
+    except ValueError:
+        return None
+    if epoch <= 0:
+        return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
+def parse_iso_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def official_reading_captured_at() -> datetime | None:
+    """When the official reading in the snapshot was captured (same lookup
+    order as the keepalive writer: officialUsage first, then weekFable)."""
+    snapshot = read_json(USAGE_PATH)
+    for key in ("officialUsage", "weekFable"):
+        block = snapshot.get(key)
+        if isinstance(block, dict):
+            captured = parse_iso_utc(block.get("capturedAt"))
+            if captured:
+                return captured
+    return None
+
+
+def clear_rate_limit_cooldown() -> None:
+    try:
+        RATE_LIMIT_COOLDOWN_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def usage_endpoint_rate_limited(text: str) -> bool:
+    lower = text.lower()
+    compact = normalize_key(text)
+    return (
+        "usage endpoint is rate limited" in lower
+        or ("usage endpoint" in lower and "rate limited" in lower)
+        or "usageendpointisratelimited" in compact
+    )
+
+
+def reap_child(pid: int) -> tuple[int, bool]:
+    # Claude can print its farewell just before the process exits. Give that
+    # clean shutdown a short reap window before sending signals.
+    for _ in range(10):
+        reaped_pid, status = os.waitpid(pid, os.WNOHANG)
+        if reaped_pid != 0:
+            return os.waitstatus_to_exitcode(status), False
+        time.sleep(0.1)
+
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(15):
+        reaped_pid, status = os.waitpid(pid, os.WNOHANG)
+        if reaped_pid != 0:
+            return os.waitstatus_to_exitcode(status), True
+        time.sleep(0.2)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status), True
+    except ChildProcessError:
+        return 0, True
+
+
+def percent_snapshot(raw_text: str) -> tuple[Any, ...]:
+    """Parse the labels and percentages visible so far, for the settle guard.
+
+    Returns an empty tuple when nothing recognizable has rendered yet, so an
+    empty reading never counts as matching a later empty reading.
+    """
+    parsed = parse_usage(raw_text, now_utc())
+    if not parsed:
+        return tuple()
+    limits = (parsed.get("officialUsage") or {}).get("limits") or []
+    return tuple((item.get("label"), item.get("usedPct")) for item in limits)
+
+
+def read_until_usage() -> tuple[str, int, bool]:
+    if not Path(CLAUDE_BIN).exists() and not shutil.which(CLAUDE_BIN):
+        return "", 127, False
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        env = os.environ.copy()
+        env.update({
+            "TERM": "xterm-256color",
+            "COLUMNS": "100",
+            "LINES": "60",
+        })
+        os.chdir(str(HOME))
+        os.execvpe(CLAUDE_BIN, [CLAUDE_BIN, "--setting-sources", "user"], env)
+
+    output = bytearray()
+    deadline = time.time() + TIMEOUT_SECONDS
+    sent_usage = False
+    sent_dismiss = False
+    sent_exit = False
+    cleanup_forced = False
+    dismissed_at: float | None = None
+    exit_code = 0
+    # Settle guard: only dismiss the panel once two parses of the accumulated
+    # output, at least SETTLE_INTERVAL_SECONDS apart, agree on every label and
+    # percentage. A panel that is still rendering (a Fable line yet to appear,
+    # a percentage still ticking in) fails this comparison and the loop keeps
+    # waiting, instead of accepting a partial read on a fixed 4-second clock.
+    settle_readings: list[tuple[float, tuple[Any, ...]]] = []
+    settled = False
+
+    try:
+        while time.time() < deadline and not _terminate_requested:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(fd, 8192)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+
+            text = output.decode("utf-8", errors="ignore")
+            clean = strip_ansi(text)
+            if not sent_usage and ("❯" in clean or "Try \"" in clean or "Claude Code" in clean):
+                os.write(fd, b"/usage\r")
+                sent_usage = True
+
+            compact = normalize_key(clean)
+            usage_ready = (
+                sent_usage
+                and "currentsession" in compact
+                and "currentweek" in compact
+            )
+
+            if usage_ready and not settled:
+                now_ts = time.time()
+                if not settle_readings or now_ts - settle_readings[-1][0] >= SETTLE_INTERVAL_SECONDS:
+                    snapshot = percent_snapshot(text)
+                    settle_readings.append((now_ts, snapshot))
+                    if len(settle_readings) >= 2 and snapshot and snapshot == settle_readings[-2][1]:
+                        settled = True
+
+            if settled and not sent_dismiss:
+                os.write(fd, b"\x1b")
+                sent_dismiss = True
+                dismissed_at = time.time()
+
+            if dismissed_at is not None and time.time() - dismissed_at >= 0.5 and not sent_exit:
+                os.write(fd, b"/exit\r")
+                sent_exit = True
+
+            if sent_exit and "Goodbye" in clean:
+                break
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            exit_code, cleanup_forced = reap_child(pid)
+        except ChildProcessError:
+            pass
+        except ProcessLookupError:
+            pass
+
+    return output.decode("utf-8", errors="ignore"), exit_code, cleanup_forced
+
+
+def strip_ansi(text: str) -> str:
+    stripped = ANSI_RE.sub("", text)
+    stripped = stripped.replace("\r", "\n")
+    stripped = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", stripped)
+    stripped = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", stripped)
+    return stripped
+
+
+def compact_lines(text: str) -> list[str]:
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9>+%]+", "", value.lower())
+
+
+def parse_usage(raw: str, captured_at: datetime) -> dict[str, Any]:
+    clean = strip_ansi(raw)
+    lines = compact_lines(clean)
+    body = "\n".join(lines)
+
+    current = parse_limit(lines, body, ["Current session", "5-hour limit", "5 hour limit"], "5-hour limit")
+    week = parse_limit(lines, body, ["Current week (all models)", "Weekly · all models", "Weekly all models"], "Weekly · all models")
+    sonnet = parse_limit(lines, body, ["Current week (Sonnet only)", "Current week (Sonet nly)", "Sonnet only", "Sonet nly"], "Sonnet only")
+    design = parse_limit(lines, body, ["Weekly · Claude Design", "Weekly Claude Design", "Claude Design"], "Claude Design")
+    fable = parse_limit(lines, body, ["Current week (Fable)", "Current week (Fable", "Weekly · Fable", "Weekly Fable"], "Fable weekly")
+
+    if not current and not week and not sonnet and not design and not fable:
+        return {}
+
+    payload: dict[str, Any] = {
+        "schemaVersion": 1,
+        "provider": "claude",
+        "displayName": "Claude Code",
+        "source": "claude-code-official-usage",
+        "sourceKind": "official_interactive",
+        "confidence": "official",
+        "confidenceNote": "Parsed from Claude Code's official interactive /usage panel.",
+        "updatedAt": iso_z(captured_at),
+        "capturedAt": iso_z(captured_at),
+        "eventAt": iso_z(captured_at),
+        "sourcePath": str(CAPTURE_PATH),
+        "health": {
+            "verdict": "fresh",
+            "reason": None,
+            "checkedAt": iso_z(captured_at),
+        },
+    }
+
+    if current:
+        payload["currentSession"] = window_metric(current, captured_at)
+    if week:
+        payload["week"] = window_metric(week, captured_at)
+    if fable:
+        # Own capture stamp: the statusline tap re-stamps the snapshot fresh
+        # every few minutes, so without this the panel can't tell how old the
+        # Fable reading actually is (this fetch is foreground/opt-in only).
+        fable_metric = window_metric(fable, captured_at)
+        fable_metric["capturedAt"] = iso_z(captured_at)
+        # Fable weekly resets on the same clock as the all-models week. If the
+        # Fable line's own reset text didn't parse, inherit the week's reset so
+        # the tap can still expire this reading at the weekly boundary
+        # (a null resetAt made a stale reading immortal — 2026-08-27 bug).
+        if not fable_metric.get("resetAt") and week:
+            week_metric = payload.get("week") or {}
+            fable_metric["resetAt"] = week_metric.get("resetAt")
+            fable_metric["resetLabel"] = fable_metric.get("resetLabel") or week_metric.get("resetLabel")
+        payload["weekFable"] = fable_metric
+
+    official_limits = []
+    for item in [design, sonnet, fable]:
+        if item and item.get("usedPct") is not None:
+            official_limits.append({"name": f"Limit · {item['label']}", "percent": item["usedPct"]})
+    if official_limits:
+        payload["skills"] = official_limits
+
+    contributors = parse_contributors(body)
+    if contributors:
+        payload["contributors"] = contributors
+
+    payload["officialUsage"] = {
+        "capturedAt": iso_z(captured_at),
+        "source": "pty",
+        "limits": [item for item in [current, week, fable, design, sonnet] if item],
+    }
+    return payload
+
+
+def parse_limit(lines: list[str], body: str, labels: list[str], canonical: str) -> dict[str, Any] | None:
+    label_keys = [normalize_key(label) for label in labels]
+    for label in labels:
+        idx = next((i for i, line in enumerate(lines) if any(key in normalize_key(line) for key in label_keys)), None)
+        if idx is None:
+            continue
+        window = "\n".join(lines[idx:idx + 6])
+        pct_match = re.search(r"(\d+(?:\.\d+)?)%\s*used", window, re.IGNORECASE)
+        if not pct_match:
+            pct_match = re.search(r"(\d+(?:\.\d+)?)%", window)
+        reset_label = parse_reset_label(window)
+        return {
+            "label": canonical,
+            "usedPct": round(float(pct_match.group(1)), 1) if pct_match else None,
+            "resetLabel": reset_label,
+        }
+
+    # Screenshot/OCR-like single-line fallback.
+    pattern = re.compile(
+        rf"({'|'.join(re.escape(label) for label in labels)}).*?(\d+(?:\.\d+)?)%\s*·?\s*resets?\s*([^\n]+)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(body)
+    if match:
+        return {
+            "label": canonical,
+            "usedPct": round(float(match.group(2)), 1),
+            "resetLabel": match.group(3).strip(),
+        }
+    return None
+
+
+def parse_reset_label(text: str) -> str | None:
+    match = re.search(r"R(?:esets?|ests?)\s*(.+?)(?:\s*\(|$)", text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"resets?\s+([0-9]+[hd]|[A-Z][a-z]{2,9}\s+\d{1,2}.*)", text, re.IGNORECASE)
+    if not match:
+        return None
+    label = re.sub(r"\s+", " ", match.group(1)).strip()
+    label = re.sub(r"^([A-Za-z]+)(\d)", r"\1 \2", label)
+    label = re.sub(r"(\d{1,2})at(\d)", r"\1 at \2", label, flags=re.IGNORECASE)
+    label = re.sub(r"(\d)(am|pm)$", r"\1\2", label, flags=re.IGNORECASE)
+    return label or None
+
+
+def window_metric(item: dict[str, Any], captured_at: datetime) -> dict[str, Any]:
+    reset_at = parse_reset_at(item.get("resetLabel"), captured_at)
+    return {
+        "label": item["label"],
+        "usedPct": item.get("usedPct"),
+        "resetLabel": item.get("resetLabel"),
+        "resetAt": iso_z(reset_at) if reset_at else None,
+    }
+
+
+def parse_reset_at(label: str | None, reference: datetime) -> datetime | None:
+    if not label:
+        return None
+    label = label.strip()
+    label = re.sub(r"^([A-Za-z]+)(\d)", r"\1 \2", label)
+    label = re.sub(r"(\d{1,2})at(\d)", r"\1 at \2", label, flags=re.IGNORECASE)
+    relative = re.fullmatch(r"(\d+)\s*([hd])", label, re.IGNORECASE)
+    if relative:
+        value = int(relative.group(1))
+        unit = relative.group(2).lower()
+        return reference + (timedelta(hours=value) if unit == "h" else timedelta(days=value))
+
+    match = re.search(r"([A-Za-z]+)\s+(\d{1,2})(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", label, re.IGNORECASE)
+    if match:
+        month_names = {
+            "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+            "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+            "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+            "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+        }
+        month = month_names.get(match.group(1).lower())
+        if month:
+            hour = int(match.group(3))
+            minute = int(match.group(4) or 0)
+            meridiem = (match.group(5) or "").lower()
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            if meridiem == "am" and hour == 12:
+                hour = 0
+            parsed = reference.replace(month=month, day=int(match.group(2)), hour=hour, minute=minute, second=0, microsecond=0)
+            if parsed < reference - timedelta(days=180):
+                parsed = parsed.replace(year=parsed.year + 1)
+            return parsed
+
+    time_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", label, re.IGNORECASE)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        meridiem = time_match.group(3).lower()
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+        parsed = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if parsed < reference - timedelta(hours=6):
+            parsed += timedelta(days=1)
+        return parsed
+    return None
+
+
+def parse_contributors(body: str) -> list[dict[str, Any]]:
+    found = []
+    patterns = [
+        (r"(\d+)% of your usage was while 4\+ sessions ran in parallel", "while 4+ sessions ran in parallel", "All sessions share one limit. If you don't need them all at once, queueing uses it more evenly."),
+        (r"(\d+)% of your usage was at >150k context", "at >150k context", "Longer sessions are more expensive even when cached."),
+        (r"(\d+)% of your usage came from subagent-heavy sessions", "subagent-heavy sessions", "Each subagent runs its own requests. Be deliberate about spawning them."),
+    ]
+    for pattern, label, note in patterns:
+        match = re.search(pattern, body, re.IGNORECASE)
+        if match:
+            found.append({"percent": float(match.group(1)), "label": label, "note": note})
+    compact = normalize_key(body)
+    compact_patterns = [
+        (r"(\d+)%ofyourusag\w*waswhile4\+se?s+ionsraninparallel", "while 4+ sessions ran in parallel", "All sessions share one limit. If you don't need them all at once, queueing uses it more evenly."),
+        (r"(\d+)%ofyourusagewasat>150kcontext", "at >150k context", "Longer sessions are more expensive even when cached."),
+        (r"(\d+)%ofyourusagecamefromsubagentheavysessions", "subagent-heavy sessions", "Each subagent runs its own requests. Be deliberate about spawning them."),
+    ]
+    for pattern, label, note in compact_patterns:
+        if any(item["label"] == label for item in found):
+            continue
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match:
+            found.append({"percent": float(match.group(1)), "label": label, "note": note})
+    return found
+
+
+CLAUDE_WINDOW_KEYS = ("currentSession", "week", "weekFable")
+# The skill chip a window key's own reading produces, so dropping the window
+# (see merge_snapshot's authoritative_windows) also drops its chip.
+WINDOW_SKILL_NAMES = {"weekFable": "Limit · Fable weekly"}
+# Fallback labels for matching a rateLimitExpired sentence back to its window.
+# bloom-usage-statusline-tap's expireRateLimitWindows pushes two forms per
+# expired window: the bare key literal the Swift UI matches on exactly, and a
+# human sentence that starts with the window's own label (e.g. "Fable weekly
+# reset Sep 9 4 PM"). Used only when `existing` no longer carries the window
+# itself (already expired) and so has no "label" field to read.
+WINDOW_LABELS = {
+    "currentSession": "5-hour limit",
+    "week": "Weekly · all models",
+    "weekFable": "Fable weekly",
+}
+
+
+def _rate_limit_entry_prefixes(key: str, existing: dict[str, Any]) -> set[str]:
+    prefixes = {key}
+    existing_window = existing.get(key)
+    label = existing_window.get("label") if isinstance(existing_window, dict) else None
+    prefixes.add(label or WINDOW_LABELS.get(key, ""))
+    prefixes.discard("")
+    return prefixes
+
+
+def _drop_rate_limit_entries_for_keys(expired: list[str], keys: set[str], existing: dict[str, Any]) -> list[str]:
+    prefixes: set[str] = set()
+    for key in keys:
+        prefixes |= _rate_limit_entry_prefixes(key, existing)
+    kept = []
+    for entry in expired:
+        if entry in prefixes or any(entry.startswith(f"{prefix} ") for prefix in prefixes):
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _reset_minute(reset_at: Any) -> datetime | None:
+    dt = parse_iso_utc(reset_at)
+    if not dt:
+        return None
+    return dt.replace(second=0, microsecond=0)
+
+
+def _merge_monotonic_window(existing_window: Any, official_window: Any) -> Any:
+    """The official reading is the truth as of its capture time.
+
+    Usage is normally monotonic within one window, so an existing reading
+    that shares the official resetAt (to the minute), carries a higher
+    usedPct AND was observed after the official capture is kept: usage grew
+    between the official fetch and now. An existing reading that is higher
+    but OLDER than the official capture is replaced: the account was reset
+    mid-window (bought reset, support reset) without moving resets_at, and
+    the old high number is simply stale (the 99% weekly bar on 2026-10-04
+    after the official endpoint said 2%). A different or later resetAt is a
+    new window, so the official reading wins outright.
+    """
+    if not isinstance(official_window, dict):
+        return official_window
+    tagged_official = {**official_window, "source": "official"}
+    if not isinstance(existing_window, dict):
+        return tagged_official
+    existing_minute = _reset_minute(existing_window.get("resetAt"))
+    official_minute = _reset_minute(tagged_official.get("resetAt"))
+    if (
+        existing_minute is not None
+        and existing_minute == official_minute
+        and isinstance(existing_window.get("usedPct"), (int, float))
+        and isinstance(tagged_official.get("usedPct"), (int, float))
+        and existing_window["usedPct"] > tagged_official["usedPct"]
+    ):
+        existing_event = parse_iso_utc(existing_window.get("eventAt"))
+        official_event = parse_iso_utc(tagged_official.get("eventAt"))
+        if existing_event and official_event and existing_event > official_event:
+            return existing_window
+    return tagged_official
+
+
+def merge_snapshot(
+    existing: dict[str, Any],
+    official: dict[str, Any],
+    authoritative_windows: set[str] | None = None,
+) -> dict[str, Any]:
+    """Merge an official reading onto the live snapshot.
+
+    `authoritative_windows` is the set of currentSession/week/weekFable keys
+    the official reading actually carries. Only the API path passes it: a
+    successful API response is authoritative for the whole Claude window
+    set, so any of those three keys it did NOT carry must be deleted here
+    instead of surviving the {**existing, **official} spread below under
+    this fetch's fresh stamp. Left at the default None, nothing beyond what
+    the dict spread already overwrites is touched -- the PTY path's existing
+    behaviour, since a PTY read only ever shows whichever windows happened
+    to render and never claims to speak for the ones that did not.
+    """
+    if not official:
+        return existing
+    merged = {**existing, **official}
+    merged.pop("officialCheckedAt", None)  # dead field; nothing reads it
+
+    for window_key in ("week", "currentSession"):
+        if window_key in official:
+            merged[window_key] = _merge_monotonic_window(existing.get(window_key), official.get(window_key))
+
+    dropped_keys: set[str] = set()
+    if authoritative_windows is None:
+        for key in ["rateLimitExpired", "rateLimitExpiredAt"]:
+            merged.pop(key, None)
+    else:
+        dropped_keys = {key for key in CLAUDE_WINDOW_KEYS if key not in authoritative_windows}
+        for key in dropped_keys:
+            merged.pop(key, None)
+
+        expired = _drop_rate_limit_entries_for_keys(
+            list(merged.get("rateLimitExpired") or []),
+            set(authoritative_windows),
+            existing,
+        )
+        if "weekFable" in dropped_keys and "weekFable" not in expired:
+            # Without this literal, a response with no Fable scope leaves
+            # both weekFable and any expiry marker absent, and
+            # FableDisplay.shouldShow (UsageView.swift) hides the row
+            # outright instead of showing "no reading since reset."
+            expired.append("weekFable")
+
+        if expired:
+            merged["rateLimitExpired"] = expired
+            merged["rateLimitExpiredAt"] = official.get("updatedAt")
+        else:
+            merged.pop("rateLimitExpired", None)
+            merged.pop("rateLimitExpiredAt", None)
+
+    # The accepted official result owns health. Remove contradictory legacy
+    # warnings and attribution from the retired GSD framework.
+    merged.pop("providerHealth", None)
+    merged["subagents"] = active_attribution(existing.get("subagents") or [])
+    if existing.get("tracker"):
+        merged["tracker"] = existing["tracker"]
+    if existing.get("session"):
+        merged["session"] = existing["session"]
+    if existing.get("extraUsage"):
+        merged["extraUsage"] = existing["extraUsage"]
+    existing_limits = [item for item in existing.get("skills") or [] if str(item.get("name", "")).startswith("Limit · ")]
+    if dropped_keys:
+        drop_names = {WINDOW_SKILL_NAMES[key] for key in dropped_keys if key in WINDOW_SKILL_NAMES}
+        if drop_names:
+            existing_limits = [item for item in existing_limits if item.get("name") not in drop_names]
+    official_limits = official.get("skills") or []
+    tracker_skills = [item for item in existing.get("skills") or [] if not str(item.get("name", "")).startswith("Limit · ")]
+    merged["skills"] = dedupe_ranked([*official_limits, *existing_limits, *tracker_skills])
+    return merged
+
+
+def active_attribution(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for item in items:
+        name = str(item.get("name") or item.get("label") or "").strip()
+        if re.match(r"^gsd(?:-|$)", name, re.IGNORECASE):
+            continue
+        result.append(item)
+    return result
+
+
+def dedupe_ranked(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    result = []
+    for item in items:
+        name = item.get("name")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(item)
+    return result
+
+
+def merge_and_write(
+    official: dict[str, Any],
+    max_attempts: int = 3,
+    authoritative_windows: set[str] | None = None,
+) -> dict[str, Any]:
+    """Merge the official reading onto the live snapshot and write it.
+
+    The statusline tap re-stamps claude-usage.json every few minutes. A fetch
+    that reads the file, spends time on the network, and then blindly
+    overwrites it can clobber a tap write that landed in between. Before
+    accepting the merge as final, this re-reads the file; if its updatedAt
+    moved since the copy the merge was built from, it merges again onto the
+    fresh copy, up to max_attempts times.
+
+    `authoritative_windows` is forwarded to merge_snapshot() unchanged on
+    every attempt -- see its docstring.
+    """
+    existing = read_json(USAGE_PATH)
+    merged = merge_snapshot(existing, official, authoritative_windows)
+    for _ in range(max_attempts):
+        current = read_json(USAGE_PATH)
+        if current.get("updatedAt") == existing.get("updatedAt"):
+            break
+        existing = current
+        merged = merge_snapshot(existing, official, authoritative_windows)
+    atomic_write_json(USAGE_PATH, merged)
+    return merged
+
+
+def parse_resets_at(raw: str | None) -> datetime | None:
+    """Parse the API's resets_at (ISO with a numeric offset and microseconds)."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    # The endpoint reports resets a fraction of a second early (22:59:59.638
+    # for a 23:00 reset). Round to the nearest minute so labels read "4 PM",
+    # not "3 PM", and so windows match the statusline tap's on-the-minute reset.
+    parsed = parsed + timedelta(seconds=30)
+    parsed = parsed.replace(second=0, microsecond=0)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_5h_reset_label(local_dt: datetime) -> str:
+    """"h:mm a" in the machine's local time zone, e.g. "2:19 AM"."""
+    hour = local_dt.hour % 12 or 12
+    meridiem = "AM" if local_dt.hour < 12 else "PM"
+    return f"{hour}:{local_dt.minute:02d} {meridiem}"
+
+
+def format_week_reset_label(local_dt: datetime) -> str:
+    """"MMM d h a" in the machine's local time zone, e.g. "Sep 9 4 PM"."""
+    hour = local_dt.hour % 12 or 12
+    meridiem = "AM" if local_dt.hour < 12 else "PM"
+    return f"{local_dt.strftime('%b')} {local_dt.day} {hour} {meridiem}"
+
+
+def window_metric_from_reset(
+    label: str,
+    used_pct: Any,
+    reset_dt: datetime | None,
+    captured_at: datetime,
+    is_5h: bool,
+) -> dict[str, Any]:
+    reset_label = None
+    if reset_dt is not None:
+        local_reset = reset_dt.astimezone()
+        reset_label = format_5h_reset_label(local_reset) if is_5h else format_week_reset_label(local_reset)
+    return {
+        "label": label,
+        "usedPct": used_pct,
+        "resetLabel": reset_label,
+        "resetAt": iso_z_ms(reset_dt) if reset_dt is not None else None,
+        "eventAt": iso_z_ms(captured_at),
+    }
+
+
+def resolve_keychain_account() -> str:
+    account = os.environ.get("BLOOM_CLAUDE_KEYCHAIN_ACCOUNT")
+    if account:
+        return account
+    account = os.environ.get("USER")
+    if account:
+        return account
+    return os.getlogin()
+
+
+def claude_code_installed() -> bool:
+    """Claude Code creates ~/.claude on first run; without it there is no login to read."""
+    return (HOME / ".claude").exists()
+
+
+def resolve_credential() -> str | None:
+    """Resolve the Claude Code OAuth bearer token.
+
+    Checks CLAUDE_CODE_OAUTH_TOKEN first, then the macOS Keychain generic
+    password for service "Claude Code-credentials". Never reads or uses a
+    refresh token: Claude Code owns its own token refresh, so a stale access
+    token is reported as an honest status instead of being renewed here.
+    """
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        return env_token
+
+    try:
+        account = resolve_keychain_account()
+    except OSError:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+
+    raw_value = result.stdout.strip()
+    if not raw_value:
+        return None
+    try:
+        credential = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+    oauth = (credential or {}).get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    expires = oauth.get("expiresAt")
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > 0:
+        LAST_CREDENTIAL["expiresAtMs"] = int(expires)
+    return token or None
+
+
+# What the last resolve_credential() saw besides the token: only the access
+# token's expiry (a timestamp, not a secret). Claude Code's access token lives
+# about 8 hours and only Claude Code renews it, when a session runs. On a Mac
+# where no Claude Code session ran for 8 hours the Keychain holds an expired
+# token: calling the endpoint with it gets 401s, and repeated 401s earn hour-long
+# 429s that outlive the renewal. So an expired token is never sent; the lane
+# says so in plain words and re-checks the Keychain each run, fetching the
+# moment the expiry moves forward.
+LAST_CREDENTIAL: dict[str, Any] = {}
+
+# Statuses that wait for Claude Code to change its credential rather than for
+# a timer. A run with the same credential stamp skips the endpoint entirely.
+CREDENTIAL_WAIT_STATUSES = ("token_expired", "unauthorized")
+
+
+def credential_stamp() -> str | None:
+    expires = LAST_CREDENTIAL.get("expiresAtMs")
+    return str(expires) if expires else None
+
+
+def simulate_api_outcome(status_value: str) -> dict[str, Any]:
+    """Build a fetch_api_usage()-shaped outcome for BLOOM_CLAUDE_USAGE_API_FIXTURE_STATUS."""
+    normalized = status_value.strip().lower()
+    if normalized == "offline":
+        return {"kind": "offline", "detail": "simulated offline"}
+    try:
+        code = int(normalized)
+    except ValueError:
+        return {"kind": "offline", "detail": f"unrecognized fixture status {status_value}"}
+    if code == 429:
+        return {"kind": "rate_limited", "retry_after": os.environ.get("BLOOM_CLAUDE_USAGE_API_FIXTURE_RETRY_AFTER")}
+    if code in (401, 403):
+        return {"kind": "unauthorized"}
+    return {"kind": "offline", "detail": f"HTTP {code}"}
+
+
+_tls_trust_source = "interpreter"
+
+
+def build_tls_context(context: ssl.SSLContext | None = None) -> ssl.SSLContext:
+    """A verifying TLS context that still works on an interpreter with an
+    empty CA store. Falls back to the macOS system bundle, then certifi.
+    Records which store was used in _tls_trust_source for the status file.
+    """
+    global _tls_trust_source
+    ctx = context if context is not None else ssl.create_default_context()
+    if ctx.cert_store_stats().get("x509_ca", 0) > 0:
+        _tls_trust_source = "interpreter"
+        return ctx
+    for bundle in SYSTEM_CA_BUNDLES:
+        if os.path.isfile(bundle):
+            try:
+                ctx.load_verify_locations(cafile=bundle)
+            except (ssl.SSLError, OSError):
+                continue
+            if ctx.cert_store_stats().get("x509_ca", 0) > 0:
+                _tls_trust_source = bundle
+                return ctx
+    try:
+        import certifi  # type: ignore[import-not-found]
+    except ImportError:
+        certifi = None
+    if certifi is not None:
+        try:
+            ctx.load_verify_locations(cafile=certifi.where())
+            _tls_trust_source = "certifi"
+        except (ssl.SSLError, OSError):
+            pass
+    return ctx
+
+
+def fetch_api_usage(token: str) -> dict[str, Any]:
+    """Fetch the usage endpoint, or simulate it for tests.
+
+    Returns {"kind": "ok", "body": <parsed JSON>} on success, or
+    {"kind": "rate_limited" | "unauthorized" | "offline", ...} otherwise.
+    """
+    fixture_status = os.environ.get("BLOOM_CLAUDE_USAGE_API_FIXTURE_STATUS")
+    if fixture_status:
+        return simulate_api_outcome(fixture_status)
+
+    fixture_path = os.environ.get("BLOOM_CLAUDE_USAGE_API_FIXTURE")
+    if fixture_path:
+        try:
+            body = json.loads(Path(fixture_path).read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            return {"kind": "offline", "detail": str(error)}
+        return {"kind": "ok", "body": body}
+
+    request = urllib.request.Request(
+        API_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        context = build_tls_context()
+    except Exception as error:  # noqa: BLE001 - any TLS setup failure is an honest offline detail
+        return {"kind": "offline", "detail": f"TLS context failed: {error}"}
+    try:
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT_SECONDS, context=context) as response:
+            raw_body = response.read()
+    except urllib.error.HTTPError as error:
+        retry_after = error.headers.get("Retry-After") if error.headers is not None else None
+        if error.code == 429:
+            return {"kind": "rate_limited", "retry_after": retry_after}
+        if error.code in (401, 403):
+            return {"kind": "unauthorized"}
+        return {"kind": "offline", "detail": f"HTTP {error.code}"}
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        detail = str(error)
+        if "CERTIFICATE_VERIFY_FAILED" in detail:
+            detail = f"TLS trust failed under {sys.executable} (trust store: {_tls_trust_source}): {detail}"
+        return {"kind": "offline", "detail": detail}
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return {"kind": "offline", "detail": str(error)}
+    return {"kind": "ok", "body": body}
+
+
+def build_api_payload(body: dict[str, Any], captured_at: datetime) -> dict[str, Any] | None:
+    """Build the same snapshot shape parse_usage() builds, from the JSON API body.
+
+    Prefers limits[] (session, weekly_all, weekly_scoped); falls back to
+    top-level five_hour/seven_day when limits[] is absent. Returns None when
+    neither source has anything usable.
+    """
+    limits = body.get("limits") or []
+    session_item = next((item for item in limits if item.get("kind") == "session"), None)
+    weekly_all_item = next((item for item in limits if item.get("kind") == "weekly_all"), None)
+    weekly_scoped_items = [item for item in limits if item.get("kind") == "weekly_scoped"]
+
+    current_session_metric: dict[str, Any] | None = None
+    week_metric: dict[str, Any] | None = None
+    fable_metric: dict[str, Any] | None = None
+    skills: list[dict[str, Any]] = []
+    raw_limits: list[dict[str, Any]] = []
+
+    if session_item or weekly_all_item or weekly_scoped_items:
+        if session_item is not None:
+            reset_dt = parse_resets_at(session_item.get("resets_at"))
+            current_session_metric = window_metric_from_reset(
+                "5-hour limit", session_item.get("percent"), reset_dt, captured_at, is_5h=True
+            )
+            raw_limits.append(session_item)
+        if weekly_all_item is not None:
+            reset_dt = parse_resets_at(weekly_all_item.get("resets_at"))
+            week_metric = window_metric_from_reset(
+                "Weekly · all models", weekly_all_item.get("percent"), reset_dt, captured_at, is_5h=False
+            )
+            raw_limits.append(weekly_all_item)
+        for item in weekly_scoped_items:
+            display_name = ((item.get("scope") or {}).get("model") or {}).get("display_name")
+            reset_dt = parse_resets_at(item.get("resets_at"))
+            percent = item.get("percent")
+            raw_limits.append(item)
+            if display_name == "Fable":
+                fable_metric = window_metric_from_reset("Fable weekly", percent, reset_dt, captured_at, is_5h=False)
+                # Own capture stamp, matching the PTY path: the statusline tap
+                # re-stamps the snapshot fresh every few minutes, so without
+                # this the panel can't tell how old the Fable reading is.
+                fable_metric["capturedAt"] = iso_z_ms(captured_at)
+                skills.append({"name": "Limit · Fable weekly", "percent": percent})
+            elif display_name:
+                skills.append({"name": f"Limit · {display_name} weekly", "percent": percent})
+    else:
+        five_hour = body.get("five_hour")
+        seven_day = body.get("seven_day")
+        if five_hour:
+            reset_dt = parse_resets_at(five_hour.get("resets_at"))
+            current_session_metric = window_metric_from_reset(
+                "5-hour limit", five_hour.get("utilization"), reset_dt, captured_at, is_5h=True
+            )
+            raw_limits.append({"kind": "session", "percent": five_hour.get("utilization"), "resets_at": five_hour.get("resets_at")})
+        if seven_day:
+            reset_dt = parse_resets_at(seven_day.get("resets_at"))
+            week_metric = window_metric_from_reset(
+                "Weekly · all models", seven_day.get("utilization"), reset_dt, captured_at, is_5h=False
+            )
+            raw_limits.append({"kind": "weekly_all", "percent": seven_day.get("utilization"), "resets_at": seven_day.get("resets_at")})
+
+    if current_session_metric is None and week_metric is None and fable_metric is None:
+        return None
+
+    captured_iso = iso_z_ms(captured_at)
+    payload: dict[str, Any] = {
+        "schemaVersion": 1,
+        "provider": "claude",
+        "displayName": "Claude Code",
+        "source": "claude-code-official-usage-api",
+        "sourceKind": "official_api",
+        "confidence": "official",
+        "confidenceNote": "Fetched from the usage endpoint Claude Code's /usage panel reads.",
+        "updatedAt": captured_iso,
+        "capturedAt": captured_iso,
+        "eventAt": captured_iso,
+        "health": {
+            "verdict": "fresh",
+            "reason": None,
+            "checkedAt": captured_iso,
+        },
+    }
+    if current_session_metric:
+        payload["currentSession"] = current_session_metric
+    if week_metric:
+        payload["week"] = week_metric
+    if fable_metric:
+        payload["weekFable"] = fable_metric
+    if skills:
+        payload["skills"] = skills
+
+    # The usage endpoint carries no driver breakdown at all. Setting this key
+    # (rather than leaving it unset) matters: merge_snapshot's dict spread
+    # only clears a key that official actually carries, so without this an
+    # old PTY-mode contributors list from weeks ago would survive untouched
+    # under this fetch's fresh capturedAt stamp and read as current.
+    payload["contributors"] = []
+
+    official_usage: dict[str, Any] = {
+        "capturedAt": captured_iso,
+        "source": "api",
+        "limits": raw_limits,
+        "contributorsNote": (
+            "Driver breakdown is not part of the usage endpoint; Claude Code "
+            "computes it from a local transcript scan."
+        ),
+    }
+    extra_usage = body.get("extra_usage")
+    if extra_usage:
+        official_usage["extraUsage"] = {
+            "enabled": extra_usage.get("is_enabled"),
+            "usedCredits": extra_usage.get("used_credits"),
+            "monthlyLimit": extra_usage.get("monthly_limit"),
+        }
+    payload["officialUsage"] = official_usage
+    return payload
+
+
+def _write_aborted_status(captured_at: datetime) -> int:
+    """Shared abort path for a SIGTERM landing mid-run in API mode.
+
+    Mirrors the PTY path's "aborted" handling: the caller's own timeout
+    (bloom-usage-capture.sh, the live-scrape launchd job) decided this attempt
+    ran too long, so this records an honest status and stops before anything
+    half-finished gets merged into the snapshot. Routed through the same
+    failure cooldown as unauthorized/no_credential/offline/unparsed: a caller
+    whose timeout is set too tight would otherwise retry this on an
+    unthrottled loop.
+    """
+    return _write_failure_cooldown_status(
+        "aborted",
+        "official Claude usage API fetch stopped before it completed",
+        captured_at,
+    )
+
+
+def _write_failure_cooldown_status(
+    status: str,
+    message: str,
+    captured_at: datetime,
+    extra: dict[str, Any] | None = None,
+) -> int:
+    """Durable failures (no credential, a revoked token, the endpoint being
+    unreachable) are not transient the way a rate limit is: nothing about
+    retrying in 120s makes a dead Keychain entry or an expired token work.
+    These share the same cooldown file the rate-limited path uses, at the
+    longer API_FAILURE_COOLDOWN_SECONDS interval, so every caller that
+    already throttles on that file backs off instead of hammering the
+    Keychain and the endpoint on a fixed short loop.
+    """
+    retry_at = now_utc() + timedelta(seconds=API_FAILURE_COOLDOWN_SECONDS)
+    set_rate_limit_cooldown(retry_at)
+    write_official_status(status, message, captured_at, retry_at, exit_code=0, extra=extra)
+    print(message)
+    return 1
+
+
+def run_api_mode(force: bool = False) -> int:
+    captured_at = now_utc()
+    if not force:
+        # Cheap to call on a loop only because these two gates exist: the
+        # shared cooldown (a failure or 429 someone already recorded) and the
+        # reading's own age. Neither touches the status file; a skip is not
+        # an observation.
+        cooldown_until = rate_limit_cooldown_until()
+        if cooldown_until and cooldown_until > captured_at:
+            print(f"Claude official usage skipped: cooldown until {iso_z(cooldown_until)}")
+            return 0
+        reading_at = official_reading_captured_at()
+        if reading_at and (captured_at - reading_at).total_seconds() <= OFFICIAL_MAX_AGE_SECONDS:
+            print(f"Claude official usage skipped: reading {int((captured_at - reading_at).total_seconds())}s old")
+            return 0
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not claude_code_installed():
+        # Claude Code was never installed here: the lane is absent, not broken.
+        # No Keychain read, no cooldown, no failure counter.
+        message = "Claude Code is not installed on this Mac; the Claude lane stays hidden."
+        write_official_status("not_installed", message, captured_at, exit_code=0)
+        print(message)
+        return 0
+    LAST_CREDENTIAL.clear()
+    token = resolve_credential()
+    if _terminate_requested:
+        return _write_aborted_status(captured_at)
+    if not token:
+        return _write_failure_cooldown_status(
+            "no_credential",
+            "Claude Code isn't signed in on this Mac. Open Claude Code and sign in; this lane fills in by itself.",
+            captured_at,
+        )
+    stamp = credential_stamp()
+    expires_ms = LAST_CREDENTIAL.get("expiresAtMs")
+    if expires_ms and expires_ms / 1000 <= captured_at.timestamp():
+        expired_at = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
+        write_official_status(
+            "token_expired",
+            "Claude Code's sign-in on this Mac paused because Claude Code hasn't run here for a while. "
+            "Open Claude Code once and this lane catches up by itself within a minute.",
+            captured_at,
+            exit_code=0,
+            extra={"credentialStamp": stamp, "credentialExpiredAt": iso_z_ms(expired_at)},
+        )
+        print("Claude official usage skipped: Claude Code's access token expired; waiting for Claude Code to renew it")
+        return 1
+    previous_status = read_json(OFFICIAL_STATUS_PATH)
+    if (
+        not force
+        and previous_status.get("status") == "unauthorized"
+        and stamp is not None
+        and previous_status.get("credentialStamp") == stamp
+    ):
+        print("Claude official usage skipped: same credential was refused; waiting for a new sign-in")
+        return 0
+
+    outcome = fetch_api_usage(token)
+    # Backstop, not the primary defense: urllib's own timeout
+    # (API_TIMEOUT_SECONDS, 10s) already keeps fetch_api_usage() well under
+    # the calling hook's 20s cap, but this still catches a SIGTERM that
+    # arrived while resolve_credential()'s Keychain lookup was running.
+    if _terminate_requested:
+        return _write_aborted_status(captured_at)
+    kind = outcome.get("kind")
+
+    if kind == "rate_limited":
+        retry_after_raw = outcome.get("retry_after")
+        try:
+            retry_seconds = float(retry_after_raw) if retry_after_raw is not None else API_RATE_LIMIT_COOLDOWN_SECONDS
+        except (TypeError, ValueError):
+            retry_seconds = API_RATE_LIMIT_COOLDOWN_SECONDS
+        retry_at = now_utc() + timedelta(seconds=retry_seconds)
+        set_rate_limit_cooldown(retry_at)
+        write_official_status(
+            "rate_limited",
+            "Claude usage endpoint is rate-limited; local tracker data remains usable.",
+            captured_at,
+            retry_at,
+            exit_code=0,
+        )
+        print(f"Claude official usage API rate-limited; retry after {iso_z(retry_at)}")
+        return 1
+
+    if kind == "unauthorized":
+        if stamp is None:
+            # No expiry to watch (an env token): fall back to the timed cooldown.
+            return _write_failure_cooldown_status(
+                "unauthorized",
+                "Claude refused this sign-in. Open Claude Code and sign in again; this lane fills in by itself.",
+                captured_at,
+            )
+        # One refusal per credential: no timer, no hammering. The next run
+        # with a new credential (Claude Code signed in again) fetches at once.
+        write_official_status(
+            "unauthorized",
+            "Claude refused this sign-in. Open Claude Code and sign in again; this lane fills in by itself.",
+            captured_at,
+            exit_code=0,
+            extra={"credentialStamp": stamp},
+        )
+        print("Claude official usage: sign-in refused")
+        return 1
+
+    if kind != "ok":
+        detail = str(outcome.get("detail") or "").strip()
+        return _write_failure_cooldown_status(
+            "offline",
+            f"Usage endpoint unreachable: {detail}" if detail else "Usage endpoint unreachable.",
+            captured_at,
+            extra={"detail": detail or None, "interpreter": sys.executable},
+        )
+
+    body = outcome.get("body") or {}
+    official = build_api_payload(body, captured_at)
+    if official is None:
+        # Same cooldown helper as unauthorized/no_credential/offline: a
+        # response shape Claude Code changed out from under this parser is
+        # not a transient hiccup that retrying in 120s will fix, so this
+        # backs off instead of hammering the endpoint on a fixed short loop.
+        return _write_failure_cooldown_status(
+            "unparsed",
+            "No official Claude usage parsed from the API response.",
+            captured_at,
+        )
+
+    authoritative_windows = {key for key in CLAUDE_WINDOW_KEYS if key in official}
+    merged = merge_and_write(official, authoritative_windows=authoritative_windows)
+    clear_rate_limit_cooldown()
+    write_official_status("ok", "Claude Code official usage API parsed.", captured_at, exit_code=0)
+    current = merged.get("currentSession") or {}
+    week = merged.get("week") or {}
+    fable = merged.get("weekFable") or {}
+    print(f"Claude official usage (api): {current.get('usedPct')}% 5h, {week.get('usedPct')}% week, {fable.get('usedPct')}% Fable week")
+    return 0
+
+
+def is_unsettled_zero_panel(official: dict[str, Any]) -> bool:
+    """True when every percentage the PTY panel showed was 0 and no Fable
+    line was present. Historically this shape meant the panel was scraped
+    before it finished rendering, not that usage is genuinely zero.
+    """
+    limits = (official.get("officialUsage") or {}).get("limits") or []
+    percents = [item.get("usedPct") for item in limits if item.get("usedPct") is not None]
+    if not percents:
+        return False
+    if any(pct != 0 for pct in percents):
+        return False
+    return "weekFable" not in official
+
+
+def process_usage(
+    raw: str,
+    exit_code: int,
+    captured_at: datetime | None = None,
+    cleanup_exit_code: int | None = None,
+    terminated: bool = False,
+) -> int:
+    captured_at = captured_at or local_now()
+    if terminated:
+        write_official_status(
+            "aborted",
+            "official /usage scrape stopped before the panel settled",
+            captured_at,
+            exit_code=0,
+        )
+        print("official /usage scrape aborted before the panel settled")
+        return 1
+    clean = strip_ansi(raw)
+    if raw:
+        atomic_write_text(CAPTURE_PATH, clean)
+    official = parse_usage(raw, captured_at)
+    if official and is_unsettled_zero_panel(official):
+        write_official_status(
+            "unsettled",
+            "Claude Code official /usage panel showed 0% on every window with no Fable reading; rejected as unsettled.",
+            captured_at,
+            exit_code=exit_code,
+        )
+        print("Claude official usage rejected: unsettled all-zero panel with no Fable line")
+        return 1
+    if not official:
+        if usage_endpoint_rate_limited(clean):
+            retry_at = now_utc() + timedelta(seconds=RATE_LIMIT_COOLDOWN_SECONDS)
+            set_rate_limit_cooldown(retry_at)
+            write_official_status(
+                "rate_limited",
+                "Claude Code official /usage endpoint is rate-limited; local tracker data remains usable.",
+                captured_at,
+                retry_at,
+                exit_code,
+            )
+            print(f"Claude official usage rate-limited; retry after {iso_z(retry_at)}")
+            return 1
+        write_official_status("unparsed", "No official Claude usage parsed.", captured_at, exit_code=exit_code)
+        print(f"no official Claude usage parsed (exit={exit_code})")
+        return 1
+    if exit_code != 0:
+        write_official_status(
+            "failed",
+            f"Claude Code official /usage produced parseable output but exited {exit_code}; reading was not accepted.",
+            captured_at,
+            exit_code=exit_code,
+        )
+        print(f"Claude official usage rejected because Claude Code exited {exit_code}")
+        return 1
+    merged = merge_and_write(official)
+    clear_rate_limit_cooldown()
+    write_official_status(
+        "ok",
+        "Claude Code official /usage parsed.",
+        captured_at,
+        exit_code=exit_code,
+        cleanup_exit_code=cleanup_exit_code,
+    )
+    current = merged.get("currentSession") or {}
+    week = merged.get("week") or {}
+    fable = merged.get("weekFable") or {}
+    print(f"Claude official usage: {current.get('usedPct')}% 5h, {week.get('usedPct')}% week, {fable.get('usedPct')}% Fable week")
+    return 0
+
+
+def resolve_mode(cli_mode: str | None) -> str:
+    if cli_mode:
+        return cli_mode
+    return os.environ.get("BLOOM_CLAUDE_USAGE_MODE", "api")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=["api", "pty"],
+        default=None,
+        help=(
+            "Usage source: the official usage endpoint (default), or a PTY scrape "
+            "of the interactive /usage panel. Defaults to the BLOOM_CLAUDE_USAGE_MODE "
+            "environment variable, then api."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="API mode only: fetch even when the official reading is fresh or a cooldown is active.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    mode = resolve_mode(args.mode)
+    if mode == "api":
+        return run_api_mode(force=args.force)
+
+    raw, exit_code, cleanup_forced = read_until_usage()
+    cleanup_exit_code = exit_code if cleanup_forced and exit_code != 0 else None
+    effective_exit_code = 0 if cleanup_forced else exit_code
+    return process_usage(
+        raw,
+        effective_exit_code,
+        cleanup_exit_code=cleanup_exit_code,
+        terminated=_terminate_requested,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

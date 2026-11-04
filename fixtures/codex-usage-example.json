@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "provider": "codex",
+  "displayName": "Codex",
+  "source": "codex-status",
+  "updatedAt": "2026-04-28T21:30:00Z",
+  "session": {
+    "costUSD": 0,
+    "durationAPI": "0s",
+    "durationWall": "0s",
+    "codeAdded": 0,
+    "codeRemoved": 0,
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0
+  },
+  "currentSession": {
+    "label": "Current session",
+    "usedPct": 0,
+    "resetLabel": "",
+    "resetAt": null
+  },
+  "week": {
+    "label": "Current week",
+    "usedPct": 0,
+    "resetLabel": "",
+    "resetAt": null
+  },
+  "contributors": [],
+  "skills": [],
+  "subagents": [],
+  "extraUsage": null
+}

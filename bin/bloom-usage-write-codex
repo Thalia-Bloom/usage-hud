@@ -1,0 +1,481 @@
+#!/usr/bin/env node
+// Write a first-class Codex usage snapshot to the Codex Usage HUD state dir
+// from local Codex session logs. This is the producer path; the Swift app keeps
+// its session-log fallback only as backup.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const HOME = os.homedir();
+const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, '.codex');
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const PROVIDER_ID = process.env.BLOOM_USAGE_PROVIDER || 'codex';
+const DISPLAY_NAME = process.env.BLOOM_USAGE_DISPLAY_NAME || 'Codex';
+const SOURCE_NAME = process.env.BLOOM_USAGE_SOURCE || 'codex session writer';
+const SESSIONS_ROOT = path.join(CODEX_HOME, 'sessions');
+const OUT_PATH = process.env.BLOOM_USAGE_OUT || path.join(STATE_DIR, `${PROVIDER_ID}-usage.json`);
+const MAX_FILES = 80;
+const TAIL_BYTES = 2 * 1024 * 1024;
+
+main();
+
+async function main() {
+  try {
+    await refreshAccountQuota();
+    const snapshot = loadSnapshot();
+    if (!snapshot) return;
+    writeJSON(OUT_PATH, snapshot);
+  } catch (err) {
+    console.error(err && err.message ? err.message : String(err));
+    process.exitCode = 1;
+  }
+}
+
+// Session logs only change during model turns. Poll the authenticated CLI for
+// account quota independently, at most once per five minutes (also on Refresh).
+async function refreshAccountQuota() {
+  if (PROVIDER_ID !== 'codex' || process.env.BLOOM_CODEX_ACCOUNT_REFRESH === '0') return;
+  const attempt = path.join(STATE_DIR, 'codex-account-refresh-at');
+  fs.mkdirSync(STATE_DIR, {recursive: true, mode: 0o700});
+  const now = Date.now();
+  let last = 0;
+  try { last = Number(fs.readFileSync(attempt, 'utf8')); } catch (_) {}
+  if (process.env.CODEX_USAGE_HUD_MANUAL_REFRESH !== '1' && now - last < 300000) return;
+  // Claim before starting so the 15-second writer and budget refresh coalesce.
+  fs.writeFileSync(attempt, String(now), {mode: 0o600});
+  try {
+    const result = await readAccountQuota();
+    const rate = result.rateLimitsByLimitId?.codex || result.rateLimits;
+    if (!rate || (rate.limitId && rate.limitId !== 'codex')) throw new Error('Codex account quota unavailable');
+    const window = w => w && typeof w.usedPercent === 'number' && Number.isFinite(w.usedPercent)
+      && w.usedPercent >= 0 && w.usedPercent <= 100 && typeof w.resetsAt === 'number'
+      && Number.isFinite(w.resetsAt) ? {
+        used_percent: w.usedPercent, window_minutes: w.windowDurationMins, resets_at: w.resetsAt
+      } : undefined;
+    const observed = new Date().toISOString();
+    const snapshot = snapshotFromEvent({timestamp: observed}, {
+      limit_id: 'codex', primary: window(rate.primary), secondary: window(rate.secondary), credits: rate.credits
+    }, 'Codex app-server');
+    if (!snapshot.week) throw new Error('Weekly Codex account quota unavailable');
+    // Capability absence: every present slot is valid and together they
+    // classify as exactly one weekly window, in either slot. Invalid,
+    // unclassified or extra present data cannot acquire this marker.
+    const present = [rate.primary, rate.secondary].filter(w => w != null);
+    const roles = classifyRateWindows({primary: window(rate.primary), secondary: window(rate.secondary)})
+      .map(entry => entry.role);
+    if (present.every(w => window(w)) && roles.length === 1 && roles[0] === 'week'
+        && snapshot.week && !snapshot.currentSession)
+      snapshot.accountQuotaCapability = 'weekly_only';
+    snapshot.source = 'Codex account/rateLimits/read';
+    snapshot.sourceKind = 'official_app_server';
+    snapshot.confidence = 'official';
+    snapshot.confidenceNote = 'Quota read from the authenticated Codex CLI account service.';
+    const accountPath = path.join(STATE_DIR, 'codex-account-usage.json');
+    let previous;
+    try { previous = JSON.parse(fs.readFileSync(accountPath, 'utf8')); } catch (_) {}
+    if (!(Date.parse(previous?.eventAt) > Date.parse(observed))) writeJSON(accountPath, snapshot);
+  } catch (_) {
+    // Preserve actual observation age; failed fetches never freshen cached quota.
+    console.error('Codex account quota refresh failed; retaining session/cache observations.');
+  }
+}
+
+function readAccountQuota() {
+  const {spawn} = require('child_process');
+  return new Promise((resolve, reject) => {
+    const env = {...process.env};
+    delete env.OPENAI_API_KEY;
+    const child = spawn('codex', ['app-server', '--listen', 'stdio://'], {env, stdio: ['pipe', 'pipe', 'ignore']});
+    let buffer = '', settled = false, result, failure;
+    const timer = setTimeout(() => finish(new Error('Codex quota timeout')), 12000);
+    const killTimer = setTimeout(() => child.kill('SIGKILL'), 15000);
+    function finish(error, value) {
+      if (settled) return;
+      settled = true; failure = error; result = value;
+      clearTimeout(timer);
+      child.stdin.end();
+      child.kill('SIGTERM');
+    }
+    function send(value) { child.stdin.write(JSON.stringify(value) + '\n'); }
+    child.on('error', error => { clearTimeout(timer); clearTimeout(killTimer); reject(error); });
+    child.stdin.on('error', error => finish(error));
+    child.on('close', () => {
+      clearTimeout(timer); clearTimeout(killTimer);
+      if (result) resolve(result); else reject(failure || new Error('Codex quota connection closed'));
+    });
+    child.stdout.on('data', chunk => {
+      buffer += chunk;
+      if (buffer.length > 1024 * 1024) return finish(new Error('Oversized Codex quota response'));
+      let index;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
+        let response;
+        try { response = JSON.parse(line); } catch (_) { continue; }
+        if (settled) continue;
+        if (response.id === 1) {
+          if (response.error) return finish(new Error('Codex initialization failed'));
+          send({method: 'initialized'});
+          send({id: 2, method: 'account/rateLimits/read', params: {}});
+        } else if (response.id === 2) {
+          finish(response.error || !response.result ? new Error('Codex quota read failed') : null, response.result);
+        }
+      }
+    });
+    send({id: 1, method: 'initialize', params: {clientInfo: {name: 'usage_hud', version: '1.0'}}});
+  });
+}
+
+function loadSnapshot() {
+  // File mtime order is not event order: a still-streaming session can keep a
+  // file "newest" with empty premium heartbeats while another file holds the
+  // freshest codex-id percentages. Pick the newest EVENT across files, not the
+  // first file that matches.
+  const files = newestJSONLFiles(SESSIONS_ROOT).slice(0, MAX_FILES);
+  let newestCandidate = null;
+  let globalCandidate = null;
+  for (const item of files) {
+    // Events can't be newer than their file's last write; once the best codex
+    // event beats every remaining file's mtime, stop scanning.
+    if (globalCandidate && eventMillis(globalCandidate) >= item.mtimeMs) break;
+    const tail = readTail(item.file, TAIL_BYTES);
+    if (!tail) continue;
+    const candidate = candidateFromTail(tail, item.file);
+    if (!candidate) continue;
+    if (isNewer(candidate.newest, newestCandidate)) newestCandidate = candidate.newest;
+    if (candidate.global && isNewer(candidate.global, globalCandidate)) globalCandidate = candidate.global;
+  }
+  const pick = globalCandidate || newestCandidate;
+  const local = pick ? snapshotFromEvent(pick.event, pick.rate, pick.sourcePath) : null;
+  // The scheduler can read account quota without starting a model turn. Keep
+  // that actual observation when it is newer than an interactive session.
+  if (PROVIDER_ID === 'codex') {
+    try {
+      const official = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'codex-account-usage.json'), 'utf8'));
+      const observed = Date.parse(official.eventAt || '');
+      const validWindow = w => w && typeof w.usedPct === 'number' && Number.isFinite(w.usedPct)
+        && w.usedPct >= 0 && w.usedPct <= 100 && Number.isFinite(Date.parse(w.resetAt));
+      const liveWindow = w => validWindow(w) && Date.parse(w.resetAt) > Date.now();
+      if (official.sourceKind === 'official_app_server' && official.provider === 'codex'
+          && Number.isFinite(observed) && observed <= Date.now() + 60000
+          && validWindow(official.week) && (!local || observed > Date.parse(local.eventAt || ''))) {
+        const merged = {...official};
+        if (!liveWindow(merged.currentSession) && liveWindow(local?.currentSession)) {
+          merged.currentSession = {...local.currentSession, eventAt: local.currentSession.eventAt || local.eventAt};
+        }
+        merged.windows = [['5h', merged.currentSession], ['week', merged.week]]
+          .filter(([, w]) => validWindow(w))
+          .map(([id, w]) => ({...w, id, state: Date.parse(w.resetAt) <= Date.now() ? 'expired' : 'live'}));
+        return merged;
+      }
+    } catch (_) { /* Session events remain the fallback. */ }
+  }
+  return local;
+}
+
+function eventMillis(candidate) {
+  const ts = candidate && candidate.event && candidate.event.timestamp;
+  const millis = ts ? Date.parse(ts) : NaN;
+  return Number.isFinite(millis) ? millis : 0;
+}
+
+function isNewer(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  return eventMillis(a) > eventMillis(b);
+}
+
+function candidateFromTail(tail, sourcePath) {
+  const lines = tail.split('\n').reverse();
+  let newestCandidate = null;
+  let globalCandidate = null;
+
+  for (const line of lines) {
+    if (!line.includes('rate_limits')) continue;
+    let event;
+    try { event = JSON.parse(line); } catch (_) { continue; }
+    const rate = event && event.payload && event.payload.rate_limits;
+    if (!rate) continue;
+
+    if (!newestCandidate) newestCandidate = { event, rate, sourcePath };
+    if (String(rate.limit_id || '').toLowerCase() === 'codex') {
+      globalCandidate = { event, rate, sourcePath };
+      break;
+    }
+  }
+
+  return newestCandidate ? { newest: newestCandidate, global: globalCandidate } : null;
+}
+
+// Prepaid credits Codex draws on after the plan limit. Session events use
+// snake_case, the app server camelCase; the balance arrives as a string.
+function creditsFrom(raw) {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const balance = Number(raw.balance);
+  const unlimited = raw.unlimited === true;
+  if (!unlimited && !Number.isFinite(balance)) return undefined;
+  return pruneUndefined({
+    hasCredits: (raw.has_credits ?? raw.hasCredits) === true,
+    unlimited,
+    balance: Number.isFinite(balance) ? balance : undefined
+  });
+}
+
+function snapshotFromEvent(event, rate, sourcePath) {
+  const payload = event.payload || {};
+  const info = payload.info || {};
+  const total = info.total_token_usage || {};
+  const last = info.last_token_usage || {};
+  const plan = [rate.plan_type, rate.limit_id].filter(Boolean).join(' / ');
+  const capturedAt = new Date().toISOString();
+  const eventAt = event.timestamp || capturedAt;
+  const windows = classifyRateWindows(rate);
+  const currentSession = windows.find((item) => item.role === '5h');
+  const week = windows.find((item) => item.role === 'week');
+
+  return pruneUndefined({
+    schemaVersion: 1,
+    provider: PROVIDER_ID,
+    displayName: DISPLAY_NAME,
+    source: SOURCE_NAME,
+    sourceKind: 'local_session_log',
+    confidence: 'high',
+    confidenceNote: 'Parsed from local Codex rate-limit events; this is not an official billing API.',
+    updatedAt: eventAt,
+    eventAt,
+    capturedAt,
+    extraUsage: plan || undefined,
+    credits: creditsFrom(rate.credits),
+    session: pruneUndefined({
+      input: intOrUndefined(total.input_tokens),
+      output: intOrUndefined(total.output_tokens),
+      cacheRead: intOrUndefined(total.cached_input_tokens),
+      reasoningOutput: intOrUndefined(total.reasoning_output_tokens),
+      total: intOrUndefined(total.total_tokens),
+      lastInput: intOrUndefined(last.input_tokens),
+      lastOutput: intOrUndefined(last.output_tokens),
+      lastCacheRead: intOrUndefined(last.cached_input_tokens),
+      lastReasoningOutput: intOrUndefined(last.reasoning_output_tokens),
+      lastTotal: intOrUndefined(last.total_tokens),
+      contextWindow: intOrUndefined(info.model_context_window)
+    }),
+    currentSession: windowMetric(currentSession && currentSession.window, `${DISPLAY_NAME} 5h`, eventAt),
+    week: windowMetric(week && week.window, `${DISPLAY_NAME} weekly`, eventAt),
+    contributors: tokenContributors(total, last, info),
+    skills: rateWindowItems(windows),
+    subagents: [],
+    windows: windows.map((item, index) => schemaWindow(item, eventAt, index)),
+    health: {
+      verdict: 'fresh',
+      reason: null,
+      checkedAt: capturedAt,
+      ageSeconds: ageSeconds(eventAt)
+    },
+    sourcePath
+  });
+}
+
+function newestJSONLFiles(root) {
+  const out = [];
+  walk(root, out);
+  return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+function walk(dir, out) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walk(file, out);
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      try {
+        const stat = fs.statSync(file);
+        out.push({ file, mtimeMs: stat.mtimeMs });
+      } catch (_) {}
+    }
+  }
+}
+
+function readTail(file, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const stat = fs.fstatSync(fd);
+    const length = Math.min(maxBytes, stat.size);
+    const offset = Math.max(0, stat.size - length);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, offset);
+    let text = buffer.toString('utf8');
+    if (offset > 0) {
+      const newline = text.indexOf('\n');
+      if (newline >= 0) text = text.slice(newline + 1);
+    }
+    return text;
+  } catch (_) {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+}
+
+function windowMetric(window, fallbackLabel, eventAt) {
+  if (!window || typeof window.used_percent !== 'number') return undefined;
+  if (resetExpired(window.resets_at)) return undefined;
+  return {
+    // Observation time, not the time a later partial merge captures this data.
+    eventAt,
+    label: windowLabel(window.window_minutes) || fallbackLabel,
+    usedPct: round1(window.used_percent),
+    resetAt: resetISO(window.resets_at),
+    resetLabel: resetLabel(window.resets_at)
+  };
+}
+
+function classifyRateWindows(rate) {
+  const entries = [rate && rate.primary, rate && rate.secondary]
+    .filter((window) => window && typeof window === 'object')
+    .map((window) => ({ window, role: explicitWindowRole(window) }));
+
+  // Some Codex events put the weekly window in `primary`, so positional
+  // primary/session + secondary/week mapping is only a final fallback.
+  for (const entry of entries) {
+    if (entry.role) continue;
+    if (!entries.some((item) => item.role === '5h')) entry.role = '5h';
+    else if (!entries.some((item) => item.role === 'week')) entry.role = 'week';
+    else entry.role = 'other';
+  }
+  return entries;
+}
+
+function explicitWindowRole(window) {
+  const minutes = Number(window.window_minutes);
+  if (minutes === 10080) return 'week';
+  if (minutes === 300) return '5h';
+
+  const label = [
+    window.label,
+    window.name,
+    window.window_name,
+    window.limit_name,
+    window.period,
+    window.window
+  ].filter(Boolean).join(' ').toLowerCase();
+  if (/\b(week|weekly|7\s*-?\s*day|7d)\b/.test(label)) return 'week';
+  if (/\b(5\s*-?\s*h(?:our)?|session)\b/.test(label)) return '5h';
+  return null;
+}
+
+function schemaWindow(item, eventAt, index) {
+  const window = item.window;
+  const usedPct = typeof window.used_percent === 'number' ? round1(window.used_percent) : null;
+  const resetAt = resetISO(window.resets_at);
+  const state = usedPct == null ? 'unknown' : (resetExpired(window.resets_at) ? 'expired' : 'live');
+  const fallback = item.role === 'week'
+    ? `${DISPLAY_NAME} weekly`
+    : item.role === '5h' ? `${DISPLAY_NAME} 5h` : `${DISPLAY_NAME} window`;
+  return {
+    id: item.role === 'other' ? `window-${index + 1}` : item.role,
+    label: windowLabel(window.window_minutes) || window.label || window.name || fallback,
+    usedPct,
+    resetAt,
+    eventAt,
+    state
+  };
+}
+
+function tokenContributors(usage, lastUsage = {}, info = {}) {
+  const total = Number(usage.total_tokens || 0);
+  const items = [
+    ['Input tokens', usage.input_tokens, 'Total input volume across this Codex session.'],
+    ['Cached input', usage.cached_input_tokens, 'Cached input lowers cost, but very large contexts still create pressure.'],
+    ['Output tokens', usage.output_tokens, 'Generated output volume across this Codex session.'],
+    ['Reasoning output', usage.reasoning_output_tokens, 'Hidden reasoning tokens across this Codex session.']
+  ]
+    .filter(([, value]) => Number(value) > 0)
+    .map(([label, value, note]) => ({ label, percent: round1(Number(value) / total * 100), note }));
+
+  const contextWindow = Number(info.model_context_window || 0);
+  const lastTotal = Number(lastUsage.total_tokens || 0);
+  if (contextWindow > 0 && lastTotal > 0) {
+    items.push({
+      label: 'Context load this turn',
+      percent: round1(lastTotal / contextWindow * 100),
+      note: 'Last Codex turn token load compared with the model context window.'
+    });
+  }
+
+  return items.sort((a, b) => b.percent - a.percent);
+}
+
+function rateWindowItems(windows) {
+  return windows
+    .filter((item) => typeof item.window.used_percent === 'number' && !resetExpired(item.window.resets_at))
+    .map((item) => ({
+      name: windowLabel(item.window.window_minutes) || (item.role === 'week' ? 'Weekly window' : '5h window'),
+      percent: round1(item.window.used_percent)
+    }));
+}
+
+function windowLabel(minutes) {
+  if (minutes === 300) return 'Codex 5h';
+  if (minutes === 10080) return 'Codex weekly';
+  if (minutes === 60) return 'Codex 1h';
+  if (Number.isFinite(minutes)) return `Codex ${minutes}m`;
+  return null;
+}
+
+function resetLabel(epoch) {
+  if (epoch == null) return null;
+  const date = new Date(Number(epoch) * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  }).replace(',', '');
+}
+
+function resetISO(epoch) {
+  if (epoch == null) return null;
+  const date = new Date(Number(epoch) * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+function resetExpired(epoch) {
+  if (epoch == null) return false;
+  const millis = Number(epoch) * 1000;
+  return Number.isFinite(millis) && millis <= Date.now();
+}
+
+function ageSeconds(value) {
+  const millis = Date.parse(value);
+  if (!Number.isFinite(millis)) return null;
+  return Math.max(0, Math.floor((Date.now() - millis) / 1000));
+}
+
+function writeJSON(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, 0o600); } catch (_) {}
+}
+
+function pruneUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
+}
+
+function intOrUndefined(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : undefined;
+}
+
+function round1(value) {
+  return Math.round(Number(value) * 10) / 10;
+}

@@ -1,0 +1,87 @@
+#!/bin/bash
+# Refresh derived budget state for all providers, then fire mode-change
+# notifications. Called fire-and-forget from the statusline tap.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="${BLOOM_USAGE_BIN_DIR:-$SCRIPT_DIR}"
+# Prefer the bloom-node shim, which resolves node past a launchd or child-session PATH that has none; fall back to plain "node" when the shim is not installed yet.
+if [ -n "${BLOOM_USAGE_NODE_BIN:-}" ]; then
+  NODE_BIN="$BLOOM_USAGE_NODE_BIN"
+elif [ -x "$BIN_DIR/bloom-node" ]; then
+  NODE_BIN="$BIN_DIR/bloom-node"
+elif [ -x "$HOME/.local/bin/bloom-node" ]; then
+  NODE_BIN="$HOME/.local/bin/bloom-node"
+else
+  NODE_BIN="node"
+fi
+STATE_DIR="${CODEX_USAGE_HUD_STATE_DIR:-$HOME/.codex-usage-hud}"
+LOCK_DIR="$STATE_DIR/bloom-budget-update.lock"
+
+helper() {
+  local name="$1"
+  if [ -x "$BIN_DIR/$name" ]; then
+    printf '%s\n' "$BIN_DIR/$name"
+  else
+    printf '%s\n' "$HOME/.local/bin/$name"
+  fi
+}
+
+# Gemini/Google work uses OAuth-backed CLIs here, not API keys.
+unset GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_APPLICATION_CREDENTIALS GOOGLE_GENAI_USE_VERTEXAI
+unset GOOGLE_AUTH_ACCESS_TOKEN GOOGLE_OAUTH_ACCESS_TOKEN GOOGLE_CLOUD_ACCESS_TOKEN CLOUDSDK_AUTH_ACCESS_TOKEN
+unset XAI_API_KEY GROK_API_KEY XAI_API_BASE_URL
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+  else
+    # A foreground request must not mistake a skipped duplicate for completion.
+    if [ "${CODEX_USAGE_HUD_MANUAL_REFRESH:-0}" = "1" ]; then
+      exit 75
+    fi
+    exit 0
+  fi
+fi
+echo "$$" > "$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+
+# Each writer runs independently -- one dead lane must never block the
+# others -- but "usage refresh complete" must stay honest: it is only true
+# when every writer this run actually invoked came back clean. run_writer
+# records a label instead of swallowing the failure outright.
+failed_writers=()
+run_writer() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    return 0
+  fi
+  failed_writers+=("$label")
+  return 1
+}
+
+# Claude official usage fetches launch Claude Code through framework Python,
+# which can trigger macOS AppData TCC prompts when called from background hooks.
+# Keep the live statusline tap lightweight unless explicitly opted in.
+# The Claude lane for a zip install is owned by com.codexusagehud.claude-writer.
+if [ "${BLOOM_USAGE_ALLOW_CLAUDE_BACKGROUND_FETCH:-0}" = "1" ]; then
+  run_writer "claude-fetch" "$(helper bloom-usage-fetch-claude-official)" || true
+  run_writer "claude-writer" "$NODE_BIN" "$(helper bloom-usage-write-claude)" || true
+fi
+
+run_writer "codex-writer" "$NODE_BIN" "$(helper bloom-usage-write-codex)" || true
+run_writer "gemini-writer" "$NODE_BIN" "$(helper bloom-usage-write-gemini-agy)" || true
+run_writer "grok-writer" "$NODE_BIN" "$(helper bloom-usage-write-grok)" || true
+
+nohup "$NODE_BIN" "$(helper bloom-budget-notify)" >/dev/null 2>&1 </dev/null &
+
+if [ "${#failed_writers[@]}" -eq 0 ]; then
+  echo "usage refresh complete"
+  exit 0
+fi
+echo "usage refresh failed: ${#failed_writers[@]} writer(s) failed (${failed_writers[*]})" >&2
+exit 1

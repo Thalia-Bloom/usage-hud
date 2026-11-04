@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_WRITER="$SCRIPT_DIR/bloom-usage-write-codex"
+INSTALLED_WRITER="${HOME}/.local/bin/bloom-usage-write-codex"
+if [ -n "${BLOOM_USAGE_NODE_BIN:-}" ]; then
+  NODE_BIN="$BLOOM_USAGE_NODE_BIN"
+elif [ -x "$SCRIPT_DIR/bloom-node" ]; then
+  NODE_BIN="$SCRIPT_DIR/bloom-node"
+else
+  NODE_BIN="node"
+fi
+
+if [ -x "$LOCAL_WRITER" ]; then
+  exec "$NODE_BIN" "$LOCAL_WRITER" "$@"
+fi
+
+exec "$NODE_BIN" "$INSTALLED_WRITER" "$@"

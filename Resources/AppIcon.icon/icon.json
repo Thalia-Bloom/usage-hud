@@ -1,0 +1,99 @@
+{
+  "color-space-for-untagged-svg-colors": "display-p3",
+  "fill": {
+    "linear-gradient": [
+      "srgb:0.18431,0.23137,0.21176,1.00000",
+      "srgb:0.05882,0.07843,0.07059,1.00000"
+    ]
+  },
+  "groups": [
+    {
+      "name": "Ticks",
+      "layers": [
+        {
+          "name": "Ticks",
+          "image-name": "ticks.svg",
+          "glass": true,
+          "hidden": false,
+          "blend-mode": "normal",
+          "fill": "automatic"
+        }
+      ],
+      "lighting": "individual",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.45
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": true
+    },
+    {
+      "name": "Lanes",
+      "layers": [
+        {
+          "name": "Claude",
+          "image-name": "bar-claude.svg",
+          "glass": true,
+          "hidden": false,
+          "blend-mode": "normal",
+          "fill": "automatic"
+        },
+        {
+          "name": "Codex",
+          "image-name": "bar-codex.svg",
+          "glass": true,
+          "hidden": false,
+          "blend-mode": "normal",
+          "fill": "automatic"
+        },
+        {
+          "name": "Gemini",
+          "image-name": "bar-gemini.svg",
+          "glass": true,
+          "hidden": false,
+          "blend-mode": "normal",
+          "fill": "automatic"
+        }
+      ],
+      "lighting": "individual",
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": true
+    },
+    {
+      "name": "Tracks",
+      "layers": [
+        {
+          "name": "Tracks",
+          "image-name": "tracks.svg",
+          "glass": false,
+          "hidden": false,
+          "blend-mode": "normal",
+          "fill": "automatic"
+        }
+      ],
+      "lighting": "individual",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.0
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": false
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

@@ -14,6 +14,8 @@ Usage HUD lives in the menu bar (no Dock icon). On first launch the panel opens 
 
 Updates install themselves after you say yes: Usage HUD checks once a day, and **Check for Updates…** checks now.
 
+If it says you are up to date, you have the newest release offered by the update feed. Preview releases on GitHub are separate and are not offered automatically; check the release notes before installing one.
+
 ## 2. Click Set up
 
 Open the panel and click **Set up**. Usage HUD looks for the coding tools on this Mac, installs a background refresh for the ones it finds, and collects the first reading. That takes about 10 seconds.
@@ -28,7 +30,7 @@ Snapshots are written to `~/.codex-usage-hud/`. The app never requires a license
 
 ## 3. Connect your agents (optional)
 
-Open **Settings › Agents** and click **Copy prompt**. Paste it into Claude Code, Codex, Gemini CLI or Cursor. That agent adds Usage HUD's read-only MCP server to each agent CLI on this Mac, asks before adding a two-line rule to their instructions, and shows you every change. See [AGENTS.md](AGENTS.md).
+Open **Settings › Agents** and click **Copy prompt**. Paste it into Claude Code, Codex, Gemini CLI or Cursor. That agent adds Usage HUD's read-only MCP server to each agent CLI on this Mac, asks before adding a two-line rule to their instructions, and shows you every change. See [agent integration guide](https://hud.thaliabloom.com/agents/).
 
 The app's command line has two commands for this. `setup` does what the Set up button does: it finds the coding tools on this Mac, installs their background refresh, takes a first reading, and prints one line per lane with the next action for any lane that needs one. `detect` only reports what it finds and changes nothing. Both take `--json`.
 
@@ -74,6 +76,10 @@ Claude Code saves its sign-in with macOS's own `security` tool, and the app read
 
 If Claude Code is not signed in, the lane reports unauthorized / missing credentials instead of a fake 0%.
 
+If the usage endpoint is **rate-limited**, keep Usage HUD open for automatic retries. The previous percentages stay marked as old until a new reading arrives. Signing in again, repeating Set up, or repeatedly clicking Refresh does not remove the endpoint's cooldown. Diagnostics shows the retry wait when available. If the reading stays old after that wait, run diagnostics again from Settings.
+
+An existing custom Claude Code status line can stay as it is. A missing heartbeat from the optional HUD statusline tap does not prevent official usage refresh.
+
 ### Gemini
 
 Needs Gemini CLI and/or Antigravity (`agy`) on this Mac. Background refresh writes `gemini-usage.json`. If no quota file exists, the app can still derive a weaker local reading from `~/.gemini/tmp/*/chats/*.jsonl`.
@@ -107,4 +113,10 @@ If Claude Code already has a `statusLine` entry, replace its `command` value wit
 
 Do not apply that change unless you want it. Set up never edits `~/.claude/settings.json`.
 
-Updates and support: https://hud.thaliabloom.com
+Help and support: https://hud.thaliabloom.com/support/
+
+In this build, **Help** in the panel or menu opens health checks, update checks
+and support contact in one place. Choose **Run health check**, then **Preview
+support report**. You can review and copy the report or open an email draft.
+Nothing is sent automatically. Only the tools you use need to be connected;
+coding-agent integration is optional.

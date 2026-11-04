@@ -1,0 +1,55 @@
+#!/bin/sh
+# bloom-node: resolve a working node binary, then exec it with the given
+# arguments. The statusline, hooks, and writers call this instead of
+# calling "node" directly, because launchd and other minimal-PATH
+# environments do not always have node on PATH.
+#
+# Resolution order:
+#   1. $BLOOM_NODE_BIN, when it is set and executable
+#   2. node on PATH (command -v node)
+#   3. /opt/homebrew/bin/node (Homebrew, Apple Silicon)
+#   4. /usr/local/bin/node (Homebrew, Intel, or the official installer)
+#   5. the newest $HOME/.nvm/versions/node/*/bin/node
+#   6. $HOME/.volta/bin/node
+#
+# If none of these resolve to an executable, this prints an error to
+# stderr and exits 127.
+
+candidate=""
+
+if [ -n "$BLOOM_NODE_BIN" ] && [ -x "$BLOOM_NODE_BIN" ]; then
+  candidate="$BLOOM_NODE_BIN"
+fi
+
+if [ -z "$candidate" ]; then
+  found="$(command -v node 2>/dev/null)"
+  if [ -n "$found" ] && [ -x "$found" ]; then
+    candidate="$found"
+  fi
+fi
+
+if [ -z "$candidate" ] && [ -x /opt/homebrew/bin/node ]; then
+  candidate=/opt/homebrew/bin/node
+fi
+
+if [ -z "$candidate" ] && [ -x /usr/local/bin/node ]; then
+  candidate=/usr/local/bin/node
+fi
+
+if [ -z "$candidate" ] && [ -d "$HOME/.nvm/versions/node" ]; then
+  nvm_newest="$(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | sort -V | tail -n 1)"
+  if [ -n "$nvm_newest" ] && [ -x "$HOME/.nvm/versions/node/$nvm_newest/bin/node" ]; then
+    candidate="$HOME/.nvm/versions/node/$nvm_newest/bin/node"
+  fi
+fi
+
+if [ -z "$candidate" ] && [ -x "$HOME/.volta/bin/node" ]; then
+  candidate="$HOME/.volta/bin/node"
+fi
+
+if [ -z "$candidate" ]; then
+  echo "bloom-node: node not found" >&2
+  exit 127
+fi
+
+exec "$candidate" "$@"

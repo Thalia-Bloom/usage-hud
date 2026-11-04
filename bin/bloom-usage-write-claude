@@ -1,0 +1,429 @@
+#!/usr/bin/env node
+// Keepalive writer for the Claude row of the Codex Usage HUD.
+//
+// The real producer is bloom-usage-statusline-tap, which fires whenever Claude
+// Code's statusline render carries a rate_limits payload. When that hasn't
+// happened recently (overnight, between work blocks, after /clear, or when the
+// CC server simply doesn't include rate_limits on a given render) the
+// snapshot's freshness drifts past the HUD's 24h threshold and the row goes
+// stale even though the last-known numbers are still valid.
+//
+// This writer refreshes `capturedAt` so the HUD knows the row is being checked
+// in on, while leaving `updatedAt` pointing at the most recent real
+// statusline-tap event so the HUD can honestly display "event Xh ago" beside
+// "checked now". Source flips to a writer label so the freshness card reads
+// "writer snapshot" instead of "live statusline" until the next real tap
+// reclaims the file.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const HOME = os.homedir();
+const STATE_DIR = process.env.CODEX_USAGE_HUD_STATE_DIR || process.env.BLOOM_USAGE_DIR || path.join(HOME, '.codex-usage-hud');
+const USAGE_PATH = process.env.BLOOM_USAGE_OUT || path.join(STATE_DIR, 'claude-usage.json');
+const OFFICIAL_STATUS_PATH = process.env.BLOOM_CLAUDE_USAGE_STATUS || path.join(STATE_DIR, 'claude-official-status.json');
+const TAP_SOURCE = 'claude-code-statusline-tap';
+const KEEPALIVE_SOURCE = 'claude usage keepalive writer';
+const TAP_GRACE_SECONDS = 90;
+
+// Stale-official refetch (owns Fable freshness with no session open): when the
+// last official reading is older than this, and neither the cooldown nor the
+// attempt stamp says "already tried recently", spawn a fresh api-mode fetch.
+const OFFICIAL_MAX_AGE_SECONDS = Number(process.env.BLOOM_CLAUDE_OFFICIAL_MAX_AGE_SECONDS) || 300;
+const OFFICIAL_ATTEMPT_COOLDOWN_MS = 120 * 1000;
+const OFFICIAL_COOLDOWN_PATH = path.join(STATE_DIR, '.claude-official-rate-limited-until');
+const OFFICIAL_ATTEMPT_STAMP_PATH = path.join(STATE_DIR, '.claude-official-last-attempt');
+const OFFICIAL_FETCH_BIN = process.env.BLOOM_CLAUDE_OFFICIAL_FETCH_BIN
+  || siblingBin('bloom-usage-fetch-claude-official');
+
+// A failed Fable refetch does not make live 5h/week numbers stale when the
+// statusline tap itself reported an event more recently than this.
+const TAP_EVENT_FRESH_MS = 15 * 60 * 1000;
+
+// Durable failures that need a human (open Claude Code once / re-auth), not a
+// transient blip. A fresh tap event never bypasses degraded health for these:
+// the account-level problem is still true no matter how recently the tap fired.
+const DURABLE_OFFICIAL_STATUSES = new Set(['unauthorized', 'no_credential', 'token_expired']);
+
+main();
+
+function siblingBin(name) {
+  const dirs = [];
+  if (process.env.BLOOM_USAGE_BIN_DIR) dirs.push(process.env.BLOOM_USAGE_BIN_DIR);
+  dirs.push(__dirname);
+  dirs.push(path.join(HOME, '.local/bin'));
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    try { if (fs.existsSync(candidate)) return candidate; } catch (_) {}
+  }
+  return path.join(HOME, '.local/bin', name);
+}
+
+function main() {
+  const now = new Date();
+
+  const beforeStat = statSafe(USAGE_PATH);
+  const snapshot = readSnapshotFromDisk();
+  // A zip-only buyer has no statusline tap and no prior snapshot. Still kick
+  // the official fetch so com.codexusagehud.claude-writer can fill the lane
+  // without editing ~/.claude/settings.json.
+  if (!snapshot || typeof snapshot !== 'object' || !hasUsableSignal(snapshot)) {
+    maybeRefetchOfficial(null, now);
+    return;
+  }
+
+  // Decide the stale-official refetch before the tap-grace early return below.
+  // An active session taps every few seconds, which keeps tripping tap grace
+  // and returning early; if the refetch decision lived inside applyMerge (as
+  // it used to) that early return would silently suppress the 10-minute Fable
+  // refetch for as long as the session stayed active. The cooldown file and
+  // the 120s attempt stamp are the only throttles on this call.
+  maybeRefetchOfficial(getOfficialCapturedAt(snapshot), now);
+
+  if (shouldSkipDueToTapGrace(snapshot, now)) return;
+
+  let merged = applyMerge(snapshot, now);
+
+  // Test-only: widen the read-to-write race window so a test can rewrite the
+  // file mid-run. No-op in production (env var unset).
+  testOnlyDelay();
+
+  // Lost-update guard: something else (the statusline tap, or the official
+  // fetch this same run may have just spawned) could have rewritten the file
+  // while we were merging. If the source changed underneath us, re-read and
+  // re-apply the same merge steps on the fresh copy once, then give up
+  // silently rather than clobbering a newer write.
+  const afterStat = statSafe(USAGE_PATH);
+  if (statsDiffer(beforeStat, afterStat)) {
+    const freshSnapshot = readSnapshotFromDisk();
+    if (!freshSnapshot || typeof freshSnapshot !== 'object') return;
+    if (!hasUsableSignal(freshSnapshot)) return;
+    if (shouldSkipDueToTapGrace(freshSnapshot, now)) return;
+    merged = applyMerge(freshSnapshot, now);
+  }
+
+  writeAtomic(USAGE_PATH, merged);
+}
+
+function readSnapshotFromDisk() {
+  try {
+    return JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasUsableSignal(snapshot) {
+  return Boolean(snapshot.week || snapshot.currentSession || snapshot.session || snapshot.tracker);
+}
+
+function shouldSkipDueToTapGrace(snapshot, now) {
+  const updatedAt = parseDate(snapshot.updatedAt);
+  const source = String(snapshot.source || '');
+  return Boolean(source.startsWith(TAP_SOURCE) && updatedAt && (now - updatedAt) < TAP_GRACE_SECONDS * 1000);
+}
+
+function statSafe(target) {
+  try { return fs.statSync(target); } catch (_) { return null; }
+}
+
+function statsDiffer(a, b) {
+  if (!a && !b) return false;
+  if (!a || !b) return true;
+  return a.mtimeMs !== b.mtimeMs || a.size !== b.size;
+}
+
+// Test-only hook: BLOOM_KEEPALIVE_TEST_DELAY_MS lets script/test-claude-keepalive.py
+// widen the read-to-write race window so it can rewrite the file mid-run and
+// assert the lost-update guard picks up the fresh copy. A no-op in production.
+function testOnlyDelay() {
+  const ms = Number(process.env.BLOOM_KEEPALIVE_TEST_DELAY_MS);
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+function applyMerge(snapshot, now) {
+  // Drop legacy keepalive bookkeeping fields if present. capturedAt and the
+  // tap's own updatedAt now carry that information.
+  delete snapshot.keepaliveAt;
+  delete snapshot.lastTapAt;
+
+  snapshot.source = KEEPALIVE_SOURCE;
+  snapshot.sourceKind = snapshot.sourceKind || 'manual';
+  snapshot.confidence = snapshot.confidence || 'medium';
+  snapshot.confidenceNote = snapshot.confidenceNote || 'Local tracker snapshot; official rate-limit windows may age independently.';
+  snapshot.capturedAt = now.toISOString();
+  expireRateLimitWindows(snapshot, now);
+  mergeOfficialStatus(snapshot, now);
+  removeRetiredAttribution(snapshot);
+  normalizeSourceConfidence(snapshot);
+
+  return snapshot;
+}
+
+function getOfficialCapturedAt(snapshot) {
+  if (snapshot.officialUsage && typeof snapshot.officialUsage === 'object' && snapshot.officialUsage.capturedAt) {
+    return snapshot.officialUsage.capturedAt;
+  }
+  if (snapshot.weekFable && typeof snapshot.weekFable === 'object' && snapshot.weekFable.capturedAt) {
+    return snapshot.weekFable.capturedAt;
+  }
+  return null;
+}
+
+function maybeRefetchOfficial(officialCapturedAt, now) {
+  try {
+    const capturedDate = parseDate(officialCapturedAt);
+    const ageSeconds = capturedDate ? (now.getTime() - capturedDate.getTime()) / 1000 : Infinity;
+    if (ageSeconds <= OFFICIAL_MAX_AGE_SECONDS) return;
+    if (isOfficialCooldownActive(now)) return;
+    if (officialAttemptStampAgeMs(now) <= OFFICIAL_ATTEMPT_COOLDOWN_MS) return;
+
+    try {
+      fs.mkdirSync(path.dirname(OFFICIAL_ATTEMPT_STAMP_PATH), { recursive: true, mode: 0o700 });
+      // Content is unix epoch seconds, matching the Stop hook's `date +%s`
+      // and the tap's own write. Every reader, this writer included,
+      // throttles on the file's mtime, never on parsing this content, so
+      // the three writers of this stamp never disagree.
+      fs.writeFileSync(OFFICIAL_ATTEMPT_STAMP_PATH, String(Math.floor(now.getTime() / 1000)), { mode: 0o600 });
+    } catch (_) {
+      // Best-effort bookkeeping; a failed stamp write still lets the spawn below run.
+    }
+
+    const child = spawn(OFFICIAL_FETCH_BIN, ['--mode', 'api'], { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_) {
+    // Refetching the official reading is best-effort; it must never break the keepalive write.
+  }
+}
+
+function isOfficialCooldownActive(now) {
+  let raw;
+  try { raw = fs.readFileSync(OFFICIAL_COOLDOWN_PATH, 'utf8').trim(); } catch (_) { return false; }
+  const untilEpochSeconds = Number(raw);
+  if (!Number.isFinite(untilEpochSeconds) || untilEpochSeconds <= 0) return false;
+  return untilEpochSeconds * 1000 > now.getTime();
+}
+
+function officialAttemptStampAgeMs(now) {
+  const stat = statSafe(OFFICIAL_ATTEMPT_STAMP_PATH);
+  if (!stat) return Infinity;
+  return now.getTime() - stat.mtimeMs;
+}
+
+function normalizeSourceConfidence(snapshot) {
+  const hasOfficialWindow = Boolean(
+    (snapshot.currentSession && typeof snapshot.currentSession.usedPct === 'number') ||
+    (snapshot.week && typeof snapshot.week.usedPct === 'number')
+  );
+  if (hasOfficialWindow) return;
+
+  const hasTrackerFacts = Boolean(snapshot.tracker || snapshot.session || snapshot.extraUsage);
+  if (!hasTrackerFacts) return;
+
+  const statusReason = snapshot.officialUsageStatus && (snapshot.officialUsageStatus.status || snapshot.officialUsageStatus.reason);
+  snapshot.sourceKind = 'manual';
+  snapshot.confidence = 'medium';
+  snapshot.confidenceNote = statusReason === 'rate_limited'
+    ? 'Local tracker is fresh; Claude Code official /usage is rate-limited, so rate-limit windows are unavailable.'
+    : 'Local tracker is fresh; Claude Code official rate-limit windows are unavailable or expired.';
+}
+
+function mergeOfficialStatus(snapshot, now) {
+  let status;
+  try { status = JSON.parse(fs.readFileSync(OFFICIAL_STATUS_PATH, 'utf8')); } catch (_) { return; }
+  if (!status || typeof status !== 'object') return;
+  snapshot.officialUsageStatus = {
+    status: status.status,
+    reason: status.reason,
+    message: status.message,
+    updatedAt: status.updatedAt,
+    retryAt: status.retryAt,
+    exitCode: status.exitCode,
+    signal: status.signal,
+  };
+  const healthStatus = String(status.status || status.reason || '').toLowerCase();
+  const checkedAt = status.updatedAt || snapshot.capturedAt || new Date().toISOString();
+  const exitCode = Number(status.exitCode);
+  const nonzeroExit = status.exitCode !== undefined && status.exitCode !== null
+    && Number.isFinite(exitCode) && exitCode !== 0;
+  const signal = String(status.signal || '').trim();
+  const terminated = nonzeroExit || Boolean(signal);
+  if (['ok', 'ready', 'available'].includes(healthStatus) && !terminated) {
+    // A fresh official result is authoritative. Do not leave an older legacy
+    // warning beside it and force the panel to reconcile contradictory truth.
+    delete snapshot.providerHealth;
+    snapshot.health = { verdict: 'fresh', reason: null, checkedAt };
+  } else if (healthStatus || terminated) {
+    const tapEventAt = parseDate(snapshot.eventAt);
+    const tapEventAgeMs = tapEventAt ? (now.getTime() - tapEventAt.getTime()) : Infinity;
+    const isDurableFailure = DURABLE_OFFICIAL_STATUSES.has(healthStatus);
+    if (tapEventAgeMs < TAP_EVENT_FRESH_MS && !isDurableFailure) {
+      // The live 5h/week numbers came from a recent statusline tap event. A
+      // failed official Fable refetch does not make those numbers stale, so
+      // report fresh and leave officialUsageStatus (set above) as the only
+      // place the failure shows up, for the detail card. This bypass does not
+      // apply to durable failures (unauthorized / no_credential): those need
+      // a human regardless of how fresh the tap is, so fall through to the
+      // degraded branch below, which keeps the reason as the status message.
+      delete snapshot.providerHealth;
+      snapshot.health = { verdict: 'fresh', reason: null, checkedAt };
+    } else {
+      snapshot.providerHealth = snapshot.officialUsageStatus;
+      const terminationReason = signal ? `official /usage ended by ${signal}`
+        : nonzeroExit ? `official /usage exited ${exitCode}` : null;
+      snapshot.health = {
+        verdict: healthStatus === 'rate_limited' && !terminated ? 'stale' : 'degraded',
+        reason: terminationReason || status.message || status.reason || status.status,
+        checkedAt
+      };
+    }
+  }
+}
+
+function removeRetiredAttribution(snapshot) {
+  if (!Array.isArray(snapshot.subagents)) return;
+  snapshot.subagents = snapshot.subagents.filter((item) => {
+    const name = String(item && (item.name || item.label) || '').trim();
+    return !/^gsd(?:-|$)/i.test(name);
+  });
+}
+
+function expireRateLimitWindows(snapshot, now) {
+  const expired = [];
+  for (const key of ['currentSession', 'week', 'weekFable']) {
+    const window = snapshot[key];
+    if (!window || typeof window !== 'object' || typeof window.usedPct !== 'number') continue;
+    const resetAt = parseResetDate(window, snapshot.eventAt || snapshot.updatedAt, now);
+    if (!resetAt || resetAt > now) continue;
+    // Push the human sentence for the detail card and the bare key so the
+    // app's exact-string check (FableDisplay.shouldShow looks for the literal
+    // "weekFable") keeps working alongside the readable message.
+    addUnique(expired, `${window.label || key} reset ${window.resetLabel || resetAt.toISOString()}`);
+    addUnique(expired, key);
+    delete snapshot[key];
+  }
+  if (expired.length) {
+    snapshot.rateLimitExpiredAt = now.toISOString();
+    snapshot.rateLimitExpired = expired;
+  }
+}
+
+function addUnique(list, value) {
+  if (!list.includes(value)) list.push(value);
+}
+
+function parseResetDate(window, eventAt, now) {
+  const direct = parseDate(window.resetAt);
+  if (direct) return direct;
+
+  const label = String(window.resetLabel || '').trim();
+  if (!label) return null;
+
+  const dateWithMonth = parseMonthDayTime(label, now.getFullYear(), now);
+  if (dateWithMonth) return dateWithMonth;
+
+  const timeOnly = parseTimeOnly(label, now);
+  if (timeOnly) return timeOnly;
+
+  const eventDate = parseDate(eventAt);
+  if (eventDate) return parseTimeOnly(label, eventDate);
+  return null;
+}
+
+function parseTimeOnly(label, reference) {
+  const match = label.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || 0);
+  const meridiem = match[3].toUpperCase();
+  if (meridiem === 'PM' && hour !== 12) hour += 12;
+  if (meridiem === 'AM' && hour === 12) hour = 0;
+
+  const parsed = new Date(reference);
+  parsed.setHours(hour, minute, 0, 0);
+  if (parsed < reference && (reference - parsed) > 6 * 60 * 60 * 1000) {
+    parsed.setDate(parsed.getDate() + 1);
+  }
+  return parsed;
+}
+
+function parseMonthDayTime(label, year, now) {
+  const match = label.match(/^([A-Za-z]+)\s+(\d{1,2})(?:,)?\s+(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!match) return null;
+  const months = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
+    apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
+    aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9,
+    nov: 10, november: 10, dec: 11, december: 11,
+  };
+  const month = months[match[1].toLowerCase()];
+  if (month === undefined) return null;
+  let hour = Number(match[3]);
+  const minute = Number(match[4] || 0);
+  const meridiem = match[5].toUpperCase();
+  if (meridiem === 'PM' && hour !== 12) hour += 12;
+  if (meridiem === 'AM' && hour === 12) hour = 0;
+  const parsed = new Date(year, month, Number(match[2]), hour, minute, 0, 0);
+  if (parsed < now && (now - parsed) > 180 * 24 * 60 * 60 * 1000) {
+    parsed.setFullYear(year + 1);
+  }
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function newestISO(...values) {
+  const dates = values.map(parseDate).filter(Boolean);
+  if (!dates.length) return undefined;
+  return new Date(Math.max(...dates.map(date => date.getTime()))).toISOString();
+}
+
+function round1(n) {
+  return Math.round(Number(n) * 10) / 10;
+}
+
+function parseDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseTrackerDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function formatMoney(value) {
+  return Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 });
+}
+
+function formatCompact(value) {
+  return Number(value).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 });
+}
+
+function intOrUndefined(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : undefined;
+}
+
+function numberOrUndefined(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function pruneUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
+}
+
+function writeAtomic(target, payload) {
+  const dir = path.dirname(target);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${target}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, target);
+  try { fs.chmodSync(target, 0o600); } catch (_) {}
+}
