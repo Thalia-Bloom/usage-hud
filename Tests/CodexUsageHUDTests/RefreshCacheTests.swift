@@ -3,7 +3,7 @@ import XCTest
 
 final class RefreshCacheTests: XCTestCase {
     private func tempDir() throws -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("refresh-cache-\(UUID().uuidString)")
+        let dir = TestTemporaryDirectory.root.appendingPathComponent("refresh-cache-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         return dir

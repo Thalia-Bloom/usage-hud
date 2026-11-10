@@ -6,7 +6,7 @@ import XCTest
 /// model tokens are counted from the log Ollama actually writes.
 final class HonestCoreTests: XCTestCase {
     private func tempDir() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hud-honest-\(UUID().uuidString)")
+        let url = TestTemporaryDirectory.root.appendingPathComponent("hud-honest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url

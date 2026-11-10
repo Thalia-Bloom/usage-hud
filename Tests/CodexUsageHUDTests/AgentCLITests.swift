@@ -42,7 +42,7 @@ final class AgentCLITests: XCTestCase {
     /// Sandbox paths for Set up: temp dirs only, no launchctl, no login item.
     private func sandboxPaths(nodeAvailable: Bool = true, inApplications: Bool = true) throws -> BackgroundRefreshService.Paths {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("hud cli setup \(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud cli setup \(UUID().uuidString)")
         addTeardownBlock { try? fm.removeItem(at: root) }
         let home = root.appendingPathComponent("home")
         let bundledBin = root.appendingPathComponent("Usage HUD.app/Contents/Resources/bin")

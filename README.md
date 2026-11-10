@@ -18,7 +18,7 @@ Free. If it saves you a stalled afternoon, you can [leave a tip](https://hud.tha
 
 ## Built on trust
 
-- Everything stays on your Mac. No account, no analytics, no browser cookies.
+- Usage stays on your Mac unless you turn on the optional public badge. No account, no analytics, no browser cookies.
 - Claude numbers come from the same usage endpoint Claude Code's own `/usage` panel reads. Usage HUD never refreshes or changes your Claude Code sign-in.
 - Codex numbers come from Codex's own quota and your local session logs.
 - `codex-usage-doctor` tells you in plain English whether each number is reliable and why.

@@ -16,7 +16,7 @@ final class ClaudeNativeUsageTests: XCTestCase {
     }
 
     private func tempDir(_ name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hud-claude-native-\(name)-\(UUID().uuidString)")
+        let url = TestTemporaryDirectory.root.appendingPathComponent("hud-claude-native-\(name)-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url
