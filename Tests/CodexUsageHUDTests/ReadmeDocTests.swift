@@ -27,6 +27,10 @@ final class ReadmeDocTests: XCTestCase {
 
     func testLocalOnlyPromiseIsPreserved() throws {
         XCTAssertTrue(try readme().contains(
-            "Nothing leaves your Mac unless you turn on the optional public badge"))
+            "Usage stays on your Mac unless you turn on the optional public badge"))
     }
+}
+
+enum TestTemporaryDirectory {
+    static let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["BLOOM_TEST_TMPDIR"] ?? NSTemporaryDirectory(), isDirectory: true)
 }

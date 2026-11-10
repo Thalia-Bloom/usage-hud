@@ -5,7 +5,7 @@ import XCTest
 final class ProviderHealthContractTests: XCTestCase {
     func testEmittedGrokNotSetUpDecodesQuietly() throws {
         let fm = FileManager.default
-        let home = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString)
         try fm.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: home) }
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -61,7 +61,7 @@ final class ProviderHealthContractTests: XCTestCase {
 
     func testFilesystemDetectionKeepsInvalidAuthEntryVisible() throws {
         let fm = FileManager.default
-        let home = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString)
         let grok = home.appendingPathComponent(".grok")
         try fm.createDirectory(at: grok, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: home) }
@@ -76,7 +76,7 @@ final class ProviderHealthContractTests: XCTestCase {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         for record in [nil, "{", "", #"{"last_active_at":"2026-01-01T00:00:00Z","current_model_id":"grok-x"}"#] as [String?] {
-            let home = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let home = TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString)
             try fm.createDirectory(at: home, withIntermediateDirectories: true)
             defer { try? fm.removeItem(at: home) }
             let session = home.appendingPathComponent(".grok/sessions/project/session")

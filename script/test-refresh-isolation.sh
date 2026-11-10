@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP_DIR="$(mktemp -d)"
+TMP_DIR="$(mktemp -d "${BLOOM_TEST_TMPDIR:-${TMPDIR:-/tmp}}/hud-test.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 HOME_DIR="$TMP_DIR/home"

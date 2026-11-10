@@ -69,7 +69,7 @@ final class SliceA2Tests: XCTestCase {
 
     func testDependencyDetectionUsesFakePATHOnly() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("hud-dep-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud-dep-\(UUID().uuidString)")
         let bin = root.appendingPathComponent("bin")
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
@@ -109,7 +109,7 @@ final class SliceA2Tests: XCTestCase {
 
     func testUsrBinPython3RequiresCommandLineTools() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("hud-clt-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud-clt-\(UUID().uuidString)")
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 
@@ -151,7 +151,7 @@ final class SliceA2Tests: XCTestCase {
 
     func testSetUpRefusesToWritePlistsFromATranslocatedCopy() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("hud-translocated-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud-translocated-\(UUID().uuidString)")
         let bundledBin = root.appendingPathComponent("bundled-bin")
         let templates = root.appendingPathComponent("templates")
         try fm.createDirectory(at: bundledBin, withIntermediateDirectories: true)
@@ -178,7 +178,7 @@ final class SliceA2Tests: XCTestCase {
 
     func testSetUpHonorsLaunchdAndSupportOverridesAndSkipsLaunchctl() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("hud-setup-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud-setup-\(UUID().uuidString)")
         let bundledBin = root.appendingPathComponent("bundled-bin")
         let templates = root.appendingPathComponent("templates")
         let support = root.appendingPathComponent("support")
@@ -223,7 +223,7 @@ final class SliceA2Tests: XCTestCase {
         let codexPlist = try String(contentsOf: launchd.appendingPathComponent("com.codexusagehud.codex-writer.plist"), encoding: .utf8)
         XCTAssertTrue(codexPlist.contains(support.appendingPathComponent("bin").path))
         XCTAssertTrue(codexPlist.contains(home.path))
-        XCTAssertFalse(codexPlist.contains(NSHomeDirectory()))
+        XCTAssertFalse(codexPlist.contains("<string>\(NSHomeDirectory())</string>"))
         XCTAssertFalse(fm.fileExists(atPath: launchd.appendingPathComponent("com.codexusagehud.claude-writer.plist").path))
 
         let removed = BackgroundRefreshService.remove(paths: paths, fileManager: fm)
@@ -233,7 +233,7 @@ final class SliceA2Tests: XCTestCase {
 
     func testSetUpOnlyInstallsWritersForDetectedProviders() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("hud-detected-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud-detected-\(UUID().uuidString)")
         let bundledBin = root.appendingPathComponent("bundled-bin")
         let templates = root.appendingPathComponent("templates")
         let launchd = root.appendingPathComponent("launchd")

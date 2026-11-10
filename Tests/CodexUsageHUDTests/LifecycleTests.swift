@@ -21,7 +21,7 @@ final class LifecycleTests: XCTestCase {
     private func tempDir(_ name: String) throws -> URL {
         // A space in every temp root: "Application Support" and
         // "Usage HUD.app" must survive rendering and the shell.
-        let url = fm.temporaryDirectory.appendingPathComponent("hud life \(name) \(UUID().uuidString)")
+        let url = TestTemporaryDirectory.root.appendingPathComponent("hud life \(name) \(UUID().uuidString)")
         try fm.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { [fm] in try? fm.removeItem(at: url) }
         return url

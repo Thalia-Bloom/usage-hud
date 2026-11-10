@@ -68,7 +68,7 @@ final class ManualRefreshTests: XCTestCase {
     }
 
     func testRunnerReportsActualExitStatus() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let directory = TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         for (code, expected) in [(0, ManualRefreshOutcome.completed), (75, .alreadyRunning), (9, .failed(9))] {
@@ -82,7 +82,7 @@ final class ManualRefreshTests: XCTestCase {
     }
 
     func testTimeoutDoesNotKillBackgroundWork() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let directory = TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let marker = directory.appendingPathComponent("completed")

@@ -224,7 +224,7 @@ final class SmokeTest: XCTestCase {
     }
 
     func testOllamaLogURLsPickServerLogsOnly() throws {
-        let root = FileManager.default.temporaryDirectory
+        let root = TestTemporaryDirectory.root
             .appendingPathComponent("hud-local-logs-\(UUID().uuidString)")
         let primary = root.appendingPathComponent("ollama-logs")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -636,7 +636,7 @@ final class SmokeTest: XCTestCase {
 
     func testCodexSessionReaderPrefersNewestEventAcrossFiles() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("codex-session-reader-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("codex-session-reader-\(UUID().uuidString)")
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 
@@ -667,7 +667,7 @@ final class SmokeTest: XCTestCase {
 
     func testCodexSessionReaderSurvivesTailStartingInsideUTF8Sequence() throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("codex-session-reader-utf8-\(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("codex-session-reader-utf8-\(UUID().uuidString)")
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 

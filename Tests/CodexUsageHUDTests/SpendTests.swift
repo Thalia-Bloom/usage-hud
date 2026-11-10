@@ -14,7 +14,7 @@ final class SpendTests: XCTestCase {
     }
 
     private func tempRoot() throws -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("spend-\(UUID().uuidString)")
+        let dir = TestTemporaryDirectory.root.appendingPathComponent("spend-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         return dir

@@ -33,7 +33,7 @@ final class LoginItemTests: XCTestCase {
     }
 
     private func paths(item: FakeItem?, nodeAvailable: Bool = false) throws -> BackgroundRefreshService.Paths {
-        let root = fm.temporaryDirectory.appendingPathComponent("hud login \(UUID().uuidString)")
+        let root = TestTemporaryDirectory.root.appendingPathComponent("hud login \(UUID().uuidString)")
         addTeardownBlock { [fm] in try? fm.removeItem(at: root) }
         let home = root.appendingPathComponent("home")
         let bundledBin = root.appendingPathComponent("Usage HUD.app/Contents/Resources/bin")

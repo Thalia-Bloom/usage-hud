@@ -4,7 +4,7 @@ import Security
 
 final class SliceB1Tests: XCTestCase {
     private func tempDir(_ name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hud-b1-\(name)-\(UUID().uuidString)")
+        let url = TestTemporaryDirectory.root.appendingPathComponent("hud-b1-\(name)-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock {
             try? FileManager.default.removeItem(at: url)
@@ -277,7 +277,7 @@ final class SliceB1Tests: XCTestCase {
     // A home that never exists. A fixed path like /tmp/x picks up whatever
     // another process left there: a stray file makes Grok's session scan
     // uncertain, which correctly reports Grok as found.
-    private static let missingHome = FileManager.default.temporaryDirectory
+    private static let missingHome = TestTemporaryDirectory.root
         .appendingPathComponent("hud-missing-home-\(UUID().uuidString)", isDirectory: true)
 
     func testSetupCardPromptNotInstalled() {
