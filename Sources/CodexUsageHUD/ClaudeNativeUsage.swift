@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // In-app Claude lane: the Swift port of `bin/bloom-usage-fetch-claude-official
@@ -274,101 +275,126 @@ enum ClaudeOfficialUsageParser {
 // MARK: - Credential (port of resolve_credential)
 
 enum ClaudeNativeCredential {
-    struct CommandResult {
-        var status: Int32
-        var stdout: Data
+    struct CommandResult { var status: Int32; var stdout: Data }
+
+    enum LookupOutcome: String, Equatable, Sendable {
+        case env, keychain, credentialsFile = "credentials_file", emptyOAuth = "empty_oauth", keychainLocked = "keychain_locked", notFound = "not_found"
     }
 
-    /// CLAUDE_CODE_OAUTH_TOKEN first, then the `Claude Code-credentials`
-    /// Keychain item for the login user, read with `/usr/bin/security` exactly
-    /// as the Python fetch does (so the Keychain prompt behavior matches).
-    /// Never reads or uses the refresh token.
-    static func resolve(
-        env: [String: String],
-        account: String?,
-        runSecurity: ([String]) -> CommandResult?
-    ) -> String? {
-        if let token = env["CLAUDE_CODE_OAUTH_TOKEN"], !token.isEmpty { return token }
-        guard let account, !account.isEmpty else { return nil }
-        guard let result = runSecurity(["find-generic-password", "-s", ClaudeOfficialUsageAPI.keychainService, "-a", account, "-w"]),
-              result.status == 0
-        else { return nil }
-        planFieldsBox.set(planFields(fromKeychainValue: result.stdout))
-        expiresBox.set(expiresAt(fromKeychainValue: result.stdout))
-        return accessToken(fromKeychainValue: result.stdout)
-    }
-
-    /// The plan fields of the same Keychain item `resolve` reads for the
-    /// usage endpoint (`subscriptionType`, `rateLimitTier`). Never the token.
-    /// Nil until a live Keychain read has happened in this process.
+    static var lastLookupOutcome: LookupOutcome { lookupBox.get() ?? .notFound }
     static var lastPlanFields: [String: String]? { planFieldsBox.get() }
-
-    static func planFields(fromKeychainValue data: Data) -> [String: String]? {
-        guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty,
-              let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any]
-        else { return nil }
-        var fields: [String: String] = [:]
-        for key in ["subscriptionType", "rateLimitTier"] {
-            if let value = oauth[key] as? String, !value.isEmpty, value.count < 64 { fields[key] = value }
-        }
-        return fields.isEmpty ? nil : fields
-    }
-
-    private static let planFieldsBox = PlanFieldsBox()
-    private static let expiresBox = ExpiryBox()
-
-    /// When the access token `resolve` last read expires (a time, never the
-    /// token). Claude Code's token lives about 8 hours and only Claude Code
-    /// renews it, so on a Mac where it hasn't run lately this is in the past.
     static var lastExpiresAt: Date? { expiresBox.get() }
 
-    static func expiresAt(fromKeychainValue data: Data) -> Date? {
-        guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty,
-              let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let ms = jsonMillis(oauth["expiresAt"]), ms > 0
-        else { return nil }
-        return Date(timeIntervalSince1970: ms / 1000)
+    /// Strictly read-only credential lookup: CLAUDE_CODE_OAUTH_TOKEN first,
+    /// then Keychain (`-a account` then service-only `-s`), then optional
+    /// read-only `.credentials.json` files. Never refreshes or writes tokens.
+    static func resolve(env: [String: String], account: String?, credentialsFiles: [URL] = [],
+                        runSecurity: ([String]) -> CommandResult?) -> String? {
+        expiresBox.set(nil)
+        if let token = env["CLAUDE_CODE_OAUTH_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            lookupBox.set(.env); return token
+        }
+        var sawLocked = false, sawEmptyOAuth = false
+        if let account, !account.isEmpty {
+            for service in keychainServices(env: env) {
+                for args in [["find-generic-password", "-s", service, "-a", account, "-w"],
+                             ["find-generic-password", "-s", service, "-w"]] {
+                    guard let result = runSecurity(args) else { sawLocked = true; continue }
+                    if result.status == 0 {
+                        let parsed = parseCredentialJSON(result.stdout)
+                        if let fields = parsed.plan { planFieldsBox.set(fields) }
+                        expiresBox.set(parsed.expires)
+                        if let token = parsed.token { lookupBox.set(.keychain); return token }
+                        if parsed.emptyOAuth { sawEmptyOAuth = true }
+                        break
+                    }
+                    if result.status == 36 || result.status == 128 { sawLocked = true }
+                }
+            }
+        }
+        let fm = FileManager.default
+        for file in credentialsFiles {
+            guard let vals = try? file.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
+                  vals.isSymbolicLink != true, vals.isRegularFile == true,
+                  fm.isReadableFile(atPath: file.path), let data = try? Data(contentsOf: file) else { continue }
+            let parsed = parseCredentialJSON(data)
+            if let fields = parsed.plan { planFieldsBox.set(fields) }
+            expiresBox.set(parsed.expires)
+            if let token = parsed.token { lookupBox.set(.credentialsFile); return token }
+            if parsed.emptyOAuth { sawEmptyOAuth = true }
+        }
+        lookupBox.set(sawLocked ? .keychainLocked : (sawEmptyOAuth ? .emptyOAuth : .notFound))
+        return nil
     }
+
+    static func keychainServices(env: [String: String]) -> [String] {
+        var services = [ClaudeOfficialUsageAPI.keychainService]
+        for raw in (env["CLAUDE_CONFIG_DIR"] ?? "").split(separator: ",") {
+            let trimmed = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let absPath = URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL.path
+            let digest = SHA256.hash(data: Data(absPath.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+            let hashed = "\(ClaudeOfficialUsageAPI.keychainService)-\(digest)"
+            if !services.contains(hashed) { services.insert(hashed, at: 0) }
+        }
+        return services
+    }
+
+    static func liveCredentialsFiles(env: [String: String] = ProcessInfo.processInfo.environment) -> [URL] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let custom = (env["CLAUDE_CONFIG_DIR"] ?? "").split(separator: ",").compactMap { raw -> URL? in
+            let s = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            return s.isEmpty ? nil : URL(fileURLWithPath: NSString(string: s).expandingTildeInPath)
+        }
+        return (custom + [home.appendingPathComponent(".claude"), home.appendingPathComponent(".config/claude")])
+            .map { $0.appendingPathComponent(".credentials.json") }
+    }
+
+    private static func parseCredentialJSON(_ data: Data) -> (token: String?, expires: Date?, plan: [String: String]?, emptyOAuth: Bool) {
+        guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return (nil, nil, nil, false) }
+        guard let oauth = json["claudeAiOauth"] as? [String: Any] else { return (nil, nil, nil, true) }
+        var fields: [String: String] = [:]
+        for key in ["subscriptionType", "rateLimitTier"] {
+            if let v = oauth[key] as? String, !v.isEmpty, v.count < 64 { fields[key] = v }
+        }
+        let expires = jsonMillis(oauth["expiresAt"]).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0 / 1000) : nil }
+        let token = (oauth["accessToken"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (token?.isEmpty == false ? token : nil, expires, fields.isEmpty ? nil : fields, token?.isEmpty != false)
+    }
+
+    static func planFields(fromKeychainValue data: Data) -> [String: String]? { parseCredentialJSON(data).plan }
+    static func expiresAt(fromKeychainValue data: Data) -> Date? { parseCredentialJSON(data).expires }
+    static func accessToken(fromKeychainValue data: Data) -> String? { parseCredentialJSON(data).token }
 
     private static func jsonMillis(_ value: Any?) -> Double? {
         guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
         return number.doubleValue.isFinite ? number.doubleValue : nil
     }
 
-    private final class ExpiryBox: @unchecked Sendable {
+    fileprivate final class LockedBox<T>: @unchecked Sendable {
         private let lock = NSLock()
-        private var value: Date?
-        func set(_ newValue: Date?) { lock.lock(); value = newValue; lock.unlock() }
-        func get() -> Date? { lock.lock(); defer { lock.unlock() }; return value }
+        private var value: T
+        init(_ initial: T) { self.value = initial }
+        func set(_ newValue: T) { lock.lock(); value = newValue; lock.unlock() }
+        func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
     }
 
-    private final class PlanFieldsBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value: [String: String]?
-        func set(_ newValue: [String: String]?) { lock.lock(); if let newValue { value = newValue }; lock.unlock() }
-        func get() -> [String: String]? { lock.lock(); defer { lock.unlock() }; return value }
-    }
-
-    static func accessToken(fromKeychainValue data: Data) -> String? {
-        guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty,
-              let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
-              !token.isEmpty
-        else { return nil }
-        return token
-    }
+    private static let planFieldsBox = LockedBox<[String: String]?>(nil)
+    private static let expiresBox = LockedBox<Date?>(nil)
+    private static let lookupBox = LockedBox<LookupOutcome?>(nil)
 
     static func liveAccount(env: [String: String] = ProcessInfo.processInfo.environment) -> String? {
-        if let account = env["BLOOM_CLAUDE_KEYCHAIN_ACCOUNT"], !account.isEmpty { return account }
-        if let user = env["USER"], !user.isEmpty { return user }
+        for key in ["BLOOM_CLAUDE_KEYCHAIN_ACCOUNT", "USER", "LOGNAME"] {
+            if let v = env[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty { return v }
+        }
         let name = NSUserName()
-        return name.isEmpty ? nil : name
+        if !name.isEmpty { return name }
+        if let pw = getpwuid(getuid()), let cName = pw.pointee.pw_name {
+            let pwName = String(cString: cName)
+            if !pwName.isEmpty { return pwName }
+        }
+        return nil
     }
 
     /// Runs `/usr/bin/security` with a timeout. Output is never logged.
@@ -384,7 +410,7 @@ enum ClaudeNativeCredential {
         process.terminationHandler = { _ in exited.signal() }
         do { try process.run() } catch { return nil }
 
-        let box = DataBox()
+        let box = LockedBox(Data())
         let reader = DispatchGroup()
         reader.enter()
         DispatchQueue.global(qos: .utility).async {
@@ -399,13 +425,6 @@ enum ClaudeNativeCredential {
         }
         _ = reader.wait(timeout: .now() + 1)
         return CommandResult(status: process.terminationStatus, stdout: box.get())
-    }
-
-    private final class DataBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var data = Data()
-        func set(_ value: Data) { lock.lock(); data = value; lock.unlock() }
-        func get() -> Data { lock.lock(); defer { lock.unlock() }; return data }
     }
 }
 
@@ -478,19 +497,14 @@ enum ClaudeNativeHTTP {
         let session = URLSession(configuration: configuration)
         defer { session.finishTasksAndInvalidate() }
         let done = DispatchSemaphore(value: 0)
-        let box = ResultBox()
+        let box = ClaudeNativeCredential.LockedBox<Result<Response, Error>?>(nil)
         let task = session.dataTask(with: request) { data, response, error in
-            if let error {
-                box.set(.failure(error))
-            } else if let http = response as? HTTPURLResponse {
+            if let error { box.set(.failure(error)) }
+            else if let http = response as? HTTPURLResponse {
                 var headers: [String: String] = [:]
-                for (key, value) in http.allHeaderFields {
-                    headers[String(describing: key)] = String(describing: value)
-                }
+                for (key, value) in http.allHeaderFields { headers[String(describing: key)] = String(describing: value) }
                 box.set(.success(Response(statusCode: http.statusCode, headers: headers, body: data ?? Data())))
-            } else {
-                box.set(.failure(URLError(.badServerResponse)))
-            }
+            } else { box.set(.failure(URLError(.badServerResponse))) }
             done.signal()
         }
         task.resume()
@@ -499,13 +513,6 @@ enum ClaudeNativeHTTP {
             return .failure(URLError(.timedOut))
         }
         return box.get() ?? .failure(URLError(.unknown))
-    }
-
-    private final class ResultBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value: Result<Response, Error>?
-        func set(_ newValue: Result<Response, Error>) { lock.lock(); value = newValue; lock.unlock() }
-        func get() -> Result<Response, Error>? { lock.lock(); defer { lock.unlock() }; return value }
     }
 }
 
@@ -522,10 +529,11 @@ enum ClaudeNativeThrottle {
         sharedCooldownUntil: Date? = nil
     ) -> String? {
         let elapsed = lastAttemptAt.map { now.timeIntervalSince($0) }
-        if let elapsed, elapsed >= 0, elapsed < ClaudeOfficialUsageAPI.manualFloor {
+        let status = lastStatus?.lowercased()
+        let authRetry = trigger != .scheduled && ["no_credential", "token_expired", "keychain_locked", "unauthorized"].contains(status ?? "")
+        if !authRetry, let elapsed, elapsed >= 0, elapsed < ClaudeOfficialUsageAPI.manualFloor {
             return "last attempt \(Int(elapsed))s ago"
         }
-        let status = lastStatus?.lowercased()
         switch trigger {
         case .scheduled:
             if let retryAt, retryAt > now {
@@ -536,7 +544,8 @@ enum ClaudeNativeThrottle {
             }
             // An expired token is re-checked on its own short retry (no
             // network), so the renewed token is fetched at once.
-            if status != "token_expired", let elapsed, elapsed >= 0, elapsed < ClaudeOfficialUsageAPI.scheduledInterval {
+            if !["token_expired", "unauthorized"].contains(status ?? ""),
+               let elapsed, elapsed >= 0, elapsed < ClaudeOfficialUsageAPI.scheduledInterval {
                 return "last attempt \(Int(elapsed))s ago"
             }
         case .manual, .setup:
@@ -557,28 +566,21 @@ enum ClaudeNativeCoexistence {
     /// Another producer wrote claude-usage.json this recently: stand down.
     static let activeProducerWindow: TimeInterval = 15 * 60
 
-    enum Decision: Equatable {
-        case run
-        case standDown(String)
-    }
+    enum Decision: Equatable { case run, standDown(String) }
 
     static func decide(
-        isolatedStateDir: Bool,
-        claudeConnected: Bool,
-        setUpDone: Bool,
-        writerInstalled: Bool,
-        sharedFileModifiedAt: Date?,
-        now: Date
+        isolatedStateDir: Bool, claudeConnected: Bool, setUpDone: Bool,
+        writerInstalled: Bool, sharedFileModifiedAt: Date?, now: Date,
+        backgroundBlockedByKeychain: Bool = false
     ) -> Decision {
         if isolatedStateDir { return .standDown("isolated state dir") }
         if !claudeConnected { return .standDown("Claude lane is off") }
         if !setUpDone { return .standDown("Set up has not run") }
+        if backgroundBlockedByKeychain { return .run }
         if writerInstalled { return .standDown("\(writerLabel) owns the Claude lane") }
         if let modified = sharedFileModifiedAt {
             let age = now.timeIntervalSince(modified)
-            if age >= 0, age < activeProducerWindow {
-                return .standDown("another producer updated claude-usage.json \(Int(age))s ago")
-            }
+            if age >= 0, age < activeProducerWindow { return .standDown("another producer updated claude-usage.json \(Int(age))s ago") }
         }
         return .run
     }
@@ -587,14 +589,14 @@ enum ClaudeNativeCoexistence {
         let writerPlist = UsagePaths.launchdDirectory.appendingPathComponent("\(writerLabel).plist")
         let shared = UsagePaths.stateDirectory.appendingPathComponent("claude-usage.json")
         let modified = (try? fm.attributesOfItem(atPath: shared.path))?[.modificationDate] as? Date
-        return decide(
-            isolatedStateDir: UsagePaths.isIsolatedStateDir,
-            claudeConnected: ProviderPreferences.isConnected("claude"),
-            setUpDone: BackgroundRefreshService.isInstalled(fileManager: fm),
-            writerInstalled: fm.fileExists(atPath: writerPlist.path),
-            sharedFileModifiedAt: modified,
-            now: now
-        )
+        let statusURL = UsagePaths.stateDirectory.appendingPathComponent("claude-official-status.json")
+        let bgStatus = ((try? Data(contentsOf: statusURL))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["status"] as? String)?.lowercased()
+        let blocked = bgStatus == "keychain_locked" || bgStatus == "no_credential"
+        return decide(isolatedStateDir: UsagePaths.isIsolatedStateDir, claudeConnected: ProviderPreferences.isConnected("claude"),
+                      setUpDone: BackgroundRefreshService.isInstalled(fileManager: fm),
+                      writerInstalled: fm.fileExists(atPath: writerPlist.path), sharedFileModifiedAt: modified,
+                      now: now, backgroundBlockedByKeychain: blocked)
     }
 }
 
@@ -607,71 +609,68 @@ struct ClaudeNativeUsageReader {
     var timeZone: TimeZone
     var credential: () -> String?
     var transport: ClaudeNativeHTTP.Transport
-    /// Plan fields from the credential `credential` just read, saved beside
-    /// the usage reading so the Plans setting can detect Pro / Max 5x / Max 20x.
     var planFields: () -> [String: String]? = { nil }
-    /// Expiry of the credential `credential` just read; nil when unknown.
     var credentialExpiresAt: () -> Date? = { nil }
-    /// While the token is expired, look at the Keychain again this often
-    /// (no network); the first renewed token is fetched at once.
+    var credentialLookupOutcome: () -> ClaudeNativeCredential.LookupOutcome = { .notFound }
     static let expiredRecheck: TimeInterval = 60
 
     static func live(stateFile: URL = UsagePaths.stateDirectory.appendingPathComponent(UsagePaths.claudeNativeUsageFilename)) -> ClaudeNativeUsageReader {
-        ClaudeNativeUsageReader(
-            stateFile: stateFile,
-            sharedCooldownFile: UsagePaths.stateDirectory.appendingPathComponent(".claude-official-rate-limited-until"),
-            now: Date.init,
-            timeZone: .current,
+        let env = ProcessInfo.processInfo.environment
+        return ClaudeNativeUsageReader(
+            stateFile: stateFile, sharedCooldownFile: UsagePaths.stateDirectory.appendingPathComponent(".claude-official-rate-limited-until"),
+            now: Date.init, timeZone: .current,
             credential: {
-                ClaudeNativeCredential.resolve(
-                    env: ProcessInfo.processInfo.environment,
-                    account: ClaudeNativeCredential.liveAccount(),
-                    runSecurity: { ClaudeNativeCredential.runLiveSecurity($0) }
-                )
+                ClaudeNativeCredential.resolve(env: env, account: ClaudeNativeCredential.liveAccount(env: env),
+                                               credentialsFiles: ClaudeNativeCredential.liveCredentialsFiles(env: env),
+                                               runSecurity: { ClaudeNativeCredential.runLiveSecurity($0) })
             },
-            transport: ClaudeNativeHTTP.liveTransport,
-            planFields: { ClaudeNativeCredential.lastPlanFields },
-            credentialExpiresAt: { ClaudeNativeCredential.lastExpiresAt }
+            transport: ClaudeNativeHTTP.liveTransport, planFields: { ClaudeNativeCredential.lastPlanFields },
+            credentialExpiresAt: { ClaudeNativeCredential.lastExpiresAt }, credentialLookupOutcome: { ClaudeNativeCredential.lastLookupOutcome }
         )
     }
 
-    /// Runs one throttled fetch and writes the native snapshot. Blocking.
     @discardableResult
     func run(trigger: ClaudeNativeTrigger) -> ClaudeNativeRunReport {
-        let previous = readPrevious()
-        let status = previous?["officialUsageStatus"] as? [String: Any]
-        let attemptAt = now()
+        let previous = readPrevious(), status = previous?["officialUsageStatus"] as? [String: Any], attemptAt = now()
         if let reason = ClaudeNativeThrottle.skipReason(
-            trigger: trigger,
-            now: attemptAt,
-            lastAttemptAt: UsageInsights.parseDate(status?["updatedAt"] as? String),
-            lastStatus: status?["status"] as? String,
-            retryAt: UsageInsights.parseDate(status?["retryAt"] as? String),
+            trigger: trigger, now: attemptAt, lastAttemptAt: UsageInsights.parseDate(status?["updatedAt"] as? String),
+            lastStatus: status?["status"] as? String, retryAt: UsageInsights.parseDate(status?["retryAt"] as? String),
             sharedCooldownUntil: sharedCooldownUntil()
-        ) {
-            return .skipped(reason)
-        }
-        let document = fetchDocument(previous: previous, attemptAt: attemptAt)
+        ) { return .skipped(reason) }
+        let document = fetchDocument(previous: previous, attemptAt: attemptAt, trigger: trigger)
         write(document)
         let written = document["officialUsageStatus"] as? [String: Any]
         return .fetched(status: written?["status"] as? String ?? "unknown", message: written?["message"] as? String ?? "")
     }
 
-    /// One unthrottled fetch, returned as the snapshot document it would
-    /// write. Never touches the state file. Used by the run path and the
-    /// live probe.
-    func fetchDocument(previous: [String: Any]?, attemptAt: Date) -> [String: Any] {
+    static func credentialStamp(token: String, expiresAt: Date?) -> String {
+        if let expiresAt { return String(Int64((expiresAt.timeIntervalSince1970 * 1000).rounded())) }
+        return SHA256.hash(data: Data(token.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func fetchDocument(previous: [String: Any]?, attemptAt: Date, trigger: ClaudeNativeTrigger = .manual) -> [String: Any] {
         guard let token = credential() else {
-            return failure(previous: previous, status: "no_credential",
-                           message: "Claude Code isn't signed in on this Mac. Open Claude Code and sign in; this lane fills in by itself.",
+            let outcome = credentialLookupOutcome()
+            if outcome == .keychainLocked {
+                return failure(previous: previous, status: "keychain_locked",
+                               message: "macOS Keychain blocked access to Claude Code's sign-in. Unlock Login Keychain or click Allow if macOS asks, then click Refresh.",
+                               attemptAt: attemptAt, retryAfter: ClaudeOfficialUsageAPI.failureCooldown)
+            }
+            let msg = outcome == .emptyOAuth
+                ? "Claude is installed on this Mac, but Claude Code CLI has no local OAuth login yet (Claude Desktop chat and remote sessions don't sign in this Mac's CLI). Run `claude` in Terminal and complete `/login`; this lane fills in by itself."
+                : "Claude Code isn't signed in on this Mac. Open Claude Code and sign in; this lane fills in by itself."
+            return failure(previous: previous, status: "no_credential", message: msg,
                            attemptAt: attemptAt, retryAfter: ClaudeOfficialUsageAPI.failureCooldown)
         }
-        // An expired token is never sent: it only earns 401s, and repeated
-        // 401s earn hour-long 429s that outlast the renewal.
-        if let expires = credentialExpiresAt(), expires <= attemptAt {
-            return failure(previous: previous, status: "token_expired",
-                           message: Self.tokenExpiredMessage,
-                           attemptAt: attemptAt, retryAfter: Self.expiredRecheck)
+        let expires = credentialExpiresAt(), stamp = Self.credentialStamp(token: token, expiresAt: expires)
+        if let expires, expires <= attemptAt {
+            return failure(previous: previous, status: "token_expired", message: Self.tokenExpiredMessage,
+                           attemptAt: attemptAt, retryAfter: Self.expiredRecheck, credentialStamp: stamp)
+        }
+        let prevObj = previous?["officialUsageStatus"] as? [String: Any]
+        if trigger == .scheduled, (prevObj?["status"] as? String) == "unauthorized", (prevObj?["credentialStamp"] as? String) == stamp {
+            return failure(previous: previous, status: "unauthorized", message: Self.unauthorizedMessage,
+                           attemptAt: attemptAt, retryAfter: Self.expiredRecheck, credentialStamp: stamp)
         }
         let outcome = ClaudeNativeHTTP.classify(transport(ClaudeNativeHTTP.request(token: token)))
         switch outcome {
@@ -683,8 +682,9 @@ struct ClaudeNativeUsageReader {
                            attemptAt: attemptAt, retryAfter: seconds)
         case .unauthorized:
             return failure(previous: previous, status: "unauthorized",
-                           message: "Claude refused this sign-in. Open Claude Code and sign in again; this lane fills in by itself.",
-                           attemptAt: attemptAt, retryAfter: ClaudeOfficialUsageAPI.failureCooldown)
+                           message: Self.unauthorizedMessage,
+                           attemptAt: attemptAt, retryAfter: ClaudeOfficialUsageAPI.failureCooldown,
+                           credentialStamp: stamp)
         case .offline(let detail):
             let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
             return failure(previous: previous, status: "offline",
@@ -698,7 +698,6 @@ struct ClaudeNativeUsageReader {
                                attemptAt: attemptAt, retryAfter: ClaudeOfficialUsageAPI.failureCooldown)
             }
             let iso = ClaudeOfficialUsageParser.isoZms(attemptAt)
-            // Same per-window tag the Python merge adds to the windows it accepts.
             for key in ["currentSession", "week"] {
                 if var window = payload[key] as? [String: Any] {
                     window["source"] = "official"
@@ -713,10 +712,6 @@ struct ClaudeNativeUsageReader {
                 "updatedAt": iso,
                 "exitCode": 0,
             ] as [String: Any]
-            // A response is authoritative for the whole window set. When
-            // Fable was on this account and is now missing, keep the row and
-            // say "no reading since reset" (same literal the Python merge
-            // writes); an account that never had Fable shows no Fable row.
             if payload["weekFable"] == nil, Self.previousHadFable(previous) {
                 payload["rateLimitExpired"] = ["weekFable"]
                 payload["rateLimitExpiredAt"] = iso
@@ -726,6 +721,7 @@ struct ClaudeNativeUsageReader {
     }
 
     static let tokenExpiredMessage = "Claude Code's sign-in on this Mac paused because Claude Code hasn't run here for a while. Open Claude Code once and this lane catches up by itself within a minute."
+    static let unauthorizedMessage = "Claude refused this sign-in. Open Claude Code and sign in again; this lane fills in by itself."
 
     static func previousHadFable(_ previous: [String: Any]?) -> Bool {
         guard let previous else { return false }
@@ -734,40 +730,24 @@ struct ClaudeNativeUsageReader {
     }
 
     private func failure(
-        previous: [String: Any]?,
-        status: String,
-        message: String,
-        attemptAt: Date,
-        retryAfter: TimeInterval,
-        detail: String? = nil
+        previous: [String: Any]?, status: String, message: String, attemptAt: Date,
+        retryAfter: TimeInterval, detail: String? = nil, credentialStamp: String? = nil
     ) -> [String: Any] {
-        // Keep the last good windows and their own capture times; a failed
-        // fetch never freshens an old reading.
         var document = previous ?? [
-            "schemaVersion": 1,
-            "provider": "claude",
-            "displayName": "Claude Code",
-            "source": ClaudeOfficialUsageAPI.source,
-            "sourceKind": "official_api",
-            "contributors": [Any](),
+            "schemaVersion": 1, "provider": "claude", "displayName": "Claude Code",
+            "source": ClaudeOfficialUsageAPI.source, "sourceKind": "official_api", "contributors": [Any](),
         ]
         let iso = ClaudeOfficialUsageParser.isoZms(attemptAt)
         var statusObject: [String: Any] = [
-            "status": status,
-            "message": message,
-            "updatedAt": iso,
-            "retryAt": ClaudeOfficialUsageParser.isoZms(attemptAt.addingTimeInterval(retryAfter)),
-            "exitCode": 0,
+            "status": status, "message": message, "updatedAt": iso,
+            "retryAt": ClaudeOfficialUsageParser.isoZms(attemptAt.addingTimeInterval(retryAfter)), "exitCode": 0,
         ]
         if let detail { statusObject["detail"] = detail }
+        if let credentialStamp { statusObject["credentialStamp"] = credentialStamp }
         document["producer"] = ClaudeOfficialUsageAPI.producer
         document["officialUsageStatus"] = statusObject
         document["providerHealth"] = statusObject
-        document["health"] = [
-            "verdict": status == "rate_limited" ? "stale" : "degraded",
-            "reason": message,
-            "checkedAt": iso,
-        ] as [String: Any]
+        document["health"] = ["verdict": status == "rate_limited" ? "stale" : "degraded", "reason": message, "checkedAt": iso] as [String: Any]
         return document
     }
 

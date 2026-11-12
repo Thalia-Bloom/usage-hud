@@ -44,4 +44,16 @@ if [ -d "$SPARKLE" ]; then
   sign "$SPARKLE"
 fi
 
-sign "$APP"
+# Developer ID builds carry the iCloud key-value entitlement (Show on my iPhone
+# and iPad) and the provisioning profile that allows it. Ad-hoc builds skip both:
+# a restricted entitlement without a matching profile stops the app launching.
+# Profiles stay out of git; USAGE_HUD_PROFILE overrides the release Mac's copy.
+RES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../Resources" && pwd)"
+PROFILE="${USAGE_HUD_PROFILE:-$HOME/.appstoreconnect/profiles/UsageHUD-DeveloperID.provisionprofile}"
+if [ -n "$IDENTITY" ] && [ "$IDENTITY" != "-" ] && [ -f "$PROFILE" ]; then
+  cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+  sign --entitlements "$RES/UsageHUD.entitlements" "$APP"
+else
+  rm -f "$APP/Contents/embedded.provisionprofile"
+  sign "$APP"
+fi

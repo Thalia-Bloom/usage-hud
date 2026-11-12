@@ -40,7 +40,7 @@ def clean_env(home: Path, state: Path, extra: dict[str, str] | None = None) -> d
     env.update(
         {
             "HOME": str(home),
-            "BLOOM_CODEX_ACCOUNT_REFRESH": "0",
+            "BLOOM_CODEX_ACCOUNT_REFRESH": "0", "BLOOM_CLAUDE_OFFICIAL_FETCH_BIN": "/usr/bin/true",
             "CODEX_USAGE_HUD_STATE_DIR": str(state),
             "BLOOM_USAGE_DIR": str(state),
             "PATH": f"{Path(NODE).parent}:/usr/bin:/bin",

@@ -83,12 +83,6 @@ enum UsageInsights {
         }
     }
 
-    static func shortLabel(for id: String) -> String {
-        switch id {
-        default: return ProviderCatalog.definition(for: id)?.shortName ?? String(label(for: id).prefix(2)).uppercased()
-        }
-    }
-
     static func snapshot(for provider: String, in snapshots: [UsageSnapshot]) -> UsageSnapshot? {
         snapshots.first { $0.provider.lowercased() == provider.lowercased() }
     }
@@ -685,10 +679,6 @@ enum UsageInsights {
             let snap = snapshot(for: provider, in: snapshots)
             return windowFreshness(for: snap, now: now)?.isStale == true ? label(for: provider) : nil
         }
-    }
-
-    static func staleProviders(_ snapshots: [UsageSnapshot], now: Date = Date()) -> [String] {
-        staleSourceProviders(snapshots, now: now)
     }
 
     static func topDriverAlerts(_ budgets: [String: BudgetState]) -> [BudgetDriverAlert] {

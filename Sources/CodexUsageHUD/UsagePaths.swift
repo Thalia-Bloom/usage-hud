@@ -61,10 +61,6 @@ enum UsagePaths {
         return home.appendingPathComponent("Library/LaunchAgents")
     }
 
-    static var installedBinDirectory: URL {
-        supportDirectory.appendingPathComponent("bin")
-    }
-
     static var stateDirectoriesForRead: [URL] {
         [stateDirectory]
     }
@@ -72,10 +68,6 @@ enum UsagePaths {
     static var appSupportStateDirectoriesForRead: [URL] {
         if isIsolatedStateDir { return [] }
         return [appSupportDirectory.appendingPathComponent("state")]
-    }
-
-    static var displayStatePath: String {
-        abbreviate(stateDirectory)
     }
 
     /// Written only by the in-app Claude reader (ClaudeNativeUsageReader),

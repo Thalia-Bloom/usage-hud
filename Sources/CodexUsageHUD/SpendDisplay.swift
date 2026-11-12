@@ -66,10 +66,22 @@ enum SpendDisplay {
         /// "you pay $46 of $200/mo"
         var paid: String?
         var multiple: String?
+        /// "$92": the plans' cost this week, and the multiple as a number.
+        var paidWeek: String?
+        var multipleValue: Double?
+        var valueUSD: Double?
+        var paidWeekUSD: Double?
         /// A lane with API value has no plan set.
         var showSetPlan = false
         var reading = false
         var help = ""
+
+        /// The panel's weekly win shows only as a win: never "$0 of work",
+        /// never less work than the plans cost. Still reading counts as a win.
+        var isWin: Bool {
+            guard let v = valueUSD else { return value == nil }
+            return v > 0 && v >= (paidWeekUSD ?? 0)
+        }
     }
 
     /// One line for the lanes on show. Nil when none of them has logs and
@@ -89,17 +101,20 @@ enum SpendDisplay {
         let value = withValue.reduce(0) { $0 + ($1.apiValue?.week ?? 0) }
         let estimated = withValue.contains { $0.apiValue?.estimated == true }
         var line = ValueLine(value: money(value))
+        line.valueUSD = value
 
         let paired = priced.filter { $0.apiValue != nil }
         let monthly = priced.reduce(0) { $0 + ($1.plan.monthlyUSD ?? 0) }
         if monthly > 0 {
             let week = SpendPeriods.prorated(monthlyUSD: monthly, days: 7)
             line.paid = "you pay \(money(week)) of \(planPrice(monthly) ?? "")"
+            line.paidWeek = money(week)
+            line.paidWeekUSD = week
             let pairedMonthly = paired.reduce(0) { $0 + ($1.plan.monthlyUSD ?? 0) }
             if pairedMonthly > 0 {
                 let pairedValue = paired.reduce(0) { $0 + ($1.apiValue?.week ?? 0) }
                 let x = pairedValue / SpendPeriods.prorated(monthlyUSD: pairedMonthly, days: 7)
-                if x > 0 { line.multiple = multiple(x) }
+                if x > 0 { line.multiple = multiple(x); line.multipleValue = x }
             }
         }
         line.showSetPlan = withValue.contains { $0.plan.source == ResolvedPlan.Source.unset.rawValue && ($0.apiValue?.week ?? 0) > 0 }

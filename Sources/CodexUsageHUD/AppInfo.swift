@@ -4,8 +4,8 @@ import Foundation
 /// does not embed Info.plist, so the panel cannot rely on Bundle.main alone.
 enum AppInfo {
     static let productName = "Usage HUD"
-    static let marketingVersion = "1.3.4"
-    static let buildNumber = "14"
+    static let marketingVersion = "1.3.6"
+    static let buildNumber = "17"
     static let legalName = "Thalia Bloom"
     static let supportURL = URL(string: "https://hud.thaliabloom.com/support/")!
     static let tipURL = URL(string: "https://hud.thaliabloom.com/?source=app#tip")!
@@ -21,5 +21,4 @@ enum AppInfo {
         return marketingVersion
     }
 
-    static var resolvedVersionLine: String { "\(productName) \(resolvedMarketingVersion)" }
 }

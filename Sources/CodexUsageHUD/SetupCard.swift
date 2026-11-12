@@ -155,22 +155,8 @@ struct SetupCardModel: Equatable {
         return model
     }
 
-    static func completeBanner(summary: DetectionSummary? = nil) -> SetupCardModel {
-        var model = hidden
-        model.phase = .doneWithData
-        model.foundLine = summary?.foundLine
-        model.missingLine = summary?.missingLine
-        return model
-    }
-
-    static func live(
-        installed: Bool,
-        summary: DetectionSummary,
-        acknowledged: Bool
-    ) -> SetupCardModel {
-        if acknowledged { return .hidden }
-        if installed { return .hidden }
-        return .prompt(summary: summary)
+    static func live(installed: Bool, summary: DetectionSummary, acknowledged: Bool) -> SetupCardModel {
+        (acknowledged || installed) ? .hidden : .prompt(summary: summary)
     }
 
     static func loadFixture(from directory: URL) -> SetupCardModel? {
@@ -279,6 +265,9 @@ enum LaneSetupScoring {
         let credentialStatus = (snapshot.officialUsageStatus?.status ?? snapshot.providerHealth?.status)?.lowercased()
         if credentialStatus == "token_expired" {
             return LaneSetupResult(provider: id, name: name, status: .failure("\(name) — open Claude Code once to wake its sign-in"))
+        }
+        if credentialStatus == "keychain_locked" {
+            return LaneSetupResult(provider: id, name: name, status: .failure("\(name) — unlock Login Keychain or click Allow, then Refresh"))
         }
         if credentialStatus == "no_credential" || credentialStatus == "unauthorized" {
             return LaneSetupResult(provider: id, name: name, status: .failure("\(name) ✗ not signed in"))

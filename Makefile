@@ -1,8 +1,7 @@
 APP_NAME = CodexUsageHUD
 DISPLAY_NAME = Codex Usage HUD
 BUNDLE_ID = com.codexusagehud.app
-APP_VERSION = 1.3.4
-APP_BUILD = 14
+# Version and build live in Resources/Info.plist only (the bundle copies it as is).
 INSTALL_DIR = $(HOME)/Applications
 DIST_DIR = dist
 APP_BUNDLE = $(DIST_DIR)/$(APP_NAME).app
@@ -62,8 +61,6 @@ app: build
 	@for label in $(ALL_LAUNCHD_LABELS); do \
 		cp "launchd/$$label.plist" "$(APP_BUNDLE)/Contents/Resources/launchd/$$label.plist"; \
 	done
-	@/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(APP_VERSION)" "$(APP_BUNDLE)/Contents/Info.plist"
-	@/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(APP_BUILD)" "$(APP_BUNDLE)/Contents/Info.plist"
 	@touch "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	@# A Developer ID signature lets macOS register the app for notifications;
 	@# an ad-hoc one is refused and never shows in System Settings.

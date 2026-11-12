@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// A usage-endpoint cooldown needs time, not another sign-in or setup run.
@@ -159,6 +160,12 @@ extension UsageInsights {
             fresh.issueDetail = snapshot.officialUsageStatus?.message
             return fresh
         }
+        if snapshot.officialUsageStatus?.status?.lowercased() == "keychain_locked" {
+            if snapshot.health?.isWarning == true { fresh.state = .old }
+            fresh.issue = "allow Keychain access"
+            fresh.issueDetail = snapshot.officialUsageStatus?.message ?? snapshot.health?.reason
+            return fresh
+        }
         if let status = snapshot.officialUsageStatus?.status?.lowercased(),
            status == "unauthorized" || status == "no_credential" {
             if snapshot.health?.isWarning == true { fresh.state = .old }
@@ -215,7 +222,7 @@ struct HeaderStatus: Equatable {
         if attention.count == 1, let lane = attention.first {
             // "sign in again" is the fix, so it beats "old" even on an old lane.
             let issue = lane.freshness.issue
-            let actionable = issue == "sign in again" || issue == "open Claude Code once" || issue == "usage rate-limited" || issue?.hasPrefix("retry in ") == true
+            let actionable = issue == "sign in again" || issue == "open Claude Code once" || issue == "allow Keychain access" || issue == "usage rate-limited" || issue?.hasPrefix("retry in ") == true
             let what = actionable ? (issue ?? "old") : (lane.freshness.isOld ? "old" : (issue ?? "old"))
             return HeaderStatus(text: "\(lane.name) · \(what)", tone: .attention,
                                 help: "\(lane.name): \(describe(lane.freshness)). Other lanes are current.")
@@ -243,5 +250,52 @@ struct HeaderStatus: Equatable {
         }
         if f.isOld { return f.age.map { "reading is \(LaneFreshness.short($0)) old" } ?? "no update time" }
         return f.label
+    }
+}
+
+/// Plain-English recovery steps shown when clicking any attention label.
+struct LaneRecovery: Equatable {
+    let provider: String, title: String, why: String, step: String, command: String?
+
+    static func make(provider: String, snapshot: UsageSnapshot?, freshness: LaneFreshness) -> LaneRecovery? {
+        let id = provider.lowercased(), name = UsageInsights.label(for: id)
+        guard snapshot == nil || freshness.needsAttention else { return nil }
+        let status = (snapshot?.officialUsageStatus?.status ?? snapshot?.providerHealth?.status)?.lowercased()
+        if id == "claude" {
+            if status == "keychain_locked" {
+                return .init(provider: id, title: "Claude needs Keychain access",
+                             why: "macOS Keychain blocked background access to Claude Code's local sign-in on this Mac.",
+                             step: "Unlock Login Keychain (or click Always Allow if macOS asks), then click Check again.", command: nil)
+            }
+            if status == "rate_limited" || freshness.issue == "usage rate-limited" || freshness.issue?.hasPrefix("retry in ") == true {
+                return .init(provider: id, title: "Claude usage is cooling down",
+                             why: freshness.issueDetail ?? "Anthropic temporarily rate-limited usage checks.",
+                             step: "Keep Usage HUD open; it retries automatically once the wait ends. No sign-in needed.", command: nil)
+            }
+            if status == "token_expired" || freshness.issue == "open Claude Code once" {
+                return .init(provider: id, title: "Wake Claude Code on this Mac",
+                             why: "Claude Code's local sign-in token lasts about 8 hours. Claude Desktop chat and remote Claude Code sessions don't renew this Mac's local CLI token, and Usage HUD never refreshes tokens itself.",
+                             step: "Run `claude` once in Terminal on this Mac; this lane catches up within a minute.", command: "claude")
+            }
+            if status == "no_credential" || status == "unauthorized" || freshness.issue == "sign in again" || snapshot == nil {
+                return .init(provider: id, title: "Sign in to Claude Code on this Mac",
+                             why: "Claude Desktop chat and remote Claude Code sessions don't sign in or renew this Mac's local `claude` CLI credential.",
+                             step: "Run `claude` in Terminal on this Mac (use `/login` if prompted), then click Check again.", command: "claude")
+            }
+            return .init(provider: id, title: "Refresh Claude on this Mac",
+                         why: freshness.issueDetail ?? "The last Claude reading on this Mac is older than expected.",
+                         step: "Click Check again below, or run `claude` once in Terminal if local sign-in paused.", command: "claude")
+        }
+        let cmd: String? = id == "codex" ? "codex" : (id == "grok" ? "grok login" : (id == "gemini" ? "agy" : nil))
+        return .init(provider: id, title: "\(name) needs a fresh reading",
+                     why: freshness.issueDetail ?? "Usage HUD hasn't received a recent \(name) reading on this Mac.",
+                     step: cmd.map { "Run `\($0)` once in Terminal to verify sign-in, then click Check again." } ?? "Click Check again below.", command: cmd)
+    }
+
+    static func copyCommand(_ command: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(command, forType: .string) }
+    static func openTerminal() {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
     }
 }

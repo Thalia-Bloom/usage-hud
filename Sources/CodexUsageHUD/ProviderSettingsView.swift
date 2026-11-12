@@ -226,6 +226,7 @@ private struct GeneralSettingsPane: View {
     @ObservedObject var state: UsageState
     @ObservedObject var jobs: BackgroundJobsModel
     @State private var confirmRemove = false
+    @State private var copiedDiagnostics = false
 
     var body: some View {
         Form {
@@ -238,6 +239,13 @@ private struct GeneralSettingsPane: View {
                 if let note = jobs.openAtLoginNote {
                     WarningText(note)
                 }
+            }
+
+            Section {
+                Toggle("Show on my iPhone and iPad", isOn: Binding(
+                    get: { state.showOnMobile }, set: { state.setShowOnMobile($0) }))
+                Text("Shares usage percentages and reading times through your iCloud. Turning this off removes the shared snapshot.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -281,11 +289,17 @@ private struct GeneralSettingsPane: View {
                 }
 
                 LabeledContent {
-                    Button("Run diagnostics") { jobs.run(.diagnostics, state: state) }
-                        .disabled(jobs.busy)
+                    HStack(spacing: 8) {
+                        Button(copiedDiagnostics ? "Copied" : "Copy diagnostics") {
+                            SupportReport.copyQuickDiagnostics(snapshots: state.snapshots)
+                            copiedDiagnostics = true
+                        }
+                        Button("Run diagnostics") { jobs.run(.diagnostics, state: state) }
+                            .disabled(jobs.busy)
+                    }
                 } label: {
                     Text("Health check")
-                    Text("Checks each lane and background job.")
+                    Text("Checks each lane, or copies safe states with no secrets.")
                 }
 
                 if jobs.busy {
@@ -436,7 +450,7 @@ private struct LanesSettingsPane: View {
                 ForEach(ProviderCatalog.displayProviders) { provider in
                     ProviderPreferenceRow(
                         provider: provider,
-                        detected: state.snapshots.contains { $0.provider.lowercased() == provider.id }
+                        snapshot: UsageInsights.snapshot(for: provider.id, in: state.snapshots)
                     )
                 }
             } header: {
@@ -471,20 +485,24 @@ private struct LanesSettingsPane: View {
 
 private enum LaneColumns {
     static let toggle: CGFloat = 46
-    static let status: CGFloat = 96
+    static let status: CGFloat = 132
 }
 
 private struct ProviderPreferenceRow: View {
     let provider: ProviderDefinition
-    let detected: Bool
+    let snapshot: UsageSnapshot?
     @AppStorage private var connected: Bool
     @AppStorage private var shown: Bool
 
-    init(provider: ProviderDefinition, detected: Bool) {
+    init(provider: ProviderDefinition, snapshot: UsageSnapshot?) {
         self.provider = provider
-        self.detected = detected
+        self.snapshot = snapshot
         _connected = AppStorage(wrappedValue: true, ProviderPreferences.connectedKey(for: provider.id))
         _shown = AppStorage(wrappedValue: true, ProviderPreferences.shownKey(for: provider.id))
+    }
+
+    private var freshness: LaneFreshness? {
+        snapshot.map { UsageInsights.laneFreshness(for: $0) }
     }
 
     var body: some View {
@@ -496,21 +514,15 @@ private struct ProviderPreferenceRow: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
-            Label(statusText, systemImage: statusSymbol)
+            Label(rowStatus.text, systemImage: rowStatus.symbol)
                 .font(.caption.weight(.medium))
-                .foregroundStyle(statusColor)
+                .foregroundStyle(rowStatus.color)
                 .frame(width: LaneColumns.status, alignment: .leading)
             Toggle("Read \(provider.name) usage", isOn: $connected)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .frame(width: LaneColumns.toggle)
+                .labelsHidden().toggleStyle(.switch).controlSize(.mini).frame(width: LaneColumns.toggle)
                 .help("Let Usage HUD read \(provider.name) usage")
             Toggle("Show \(provider.name) in the panel and menu bar", isOn: $shown)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .frame(width: LaneColumns.toggle)
+                .labelsHidden().toggleStyle(.switch).controlSize(.mini).frame(width: LaneColumns.toggle)
                 .disabled(!connected)
                 .help("Show \(provider.name) in the panel and the menu bar")
         }
@@ -519,19 +531,13 @@ private struct ProviderPreferenceRow: View {
         .onChange(of: shown) { _, _ in ProviderPreferences.notifyChanged() }
     }
 
-    private var statusText: String {
-        if !connected { return "Off" }
-        return detected ? "Reading" : "No data yet"
-    }
-
-    private var statusSymbol: String {
-        if !connected { return "minus.circle" }
-        return detected ? "checkmark.circle.fill" : "clock"
-    }
-
-    private var statusColor: Color {
-        if !connected { return .secondary }
-        return detected ? .green : .orange
+    private var rowStatus: (text: String, symbol: String, color: Color) {
+        if !connected { return ("Off", "minus.circle", .secondary) }
+        guard let fresh = freshness else { return ("No data yet", "clock", .orange) }
+        if fresh.isNotSetUp { return ("Not set up", "clock", .secondary) }
+        let text = fresh.issue.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? (fresh.isOld ? "Old reading" : "Reading")
+        return (text, fresh.needsAttention ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
+                fresh.needsAttention ? .orange : .green)
     }
 }
 

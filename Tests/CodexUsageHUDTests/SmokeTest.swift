@@ -164,9 +164,9 @@ final class SmokeTest: XCTestCase {
     }
 
     func testAppInfoDeclaresVersion() {
-        XCTAssertEqual(AppInfo.marketingVersion, "1.3.4")
-        XCTAssertEqual(AppInfo.buildNumber, "14")
-        XCTAssertEqual(AppInfo.versionLine, "Usage HUD 1.3.4")
+        XCTAssertEqual(AppInfo.marketingVersion, "1.3.6")
+        XCTAssertEqual(AppInfo.buildNumber, "17")
+        XCTAssertEqual(AppInfo.versionLine, "Usage HUD 1.3.6")
         XCTAssertEqual(AppInfo.legalName, "Thalia Bloom")
         XCTAssertEqual(AppInfo.supportLine, "Updates and support: https://hud.thaliabloom.com/support/")
     }

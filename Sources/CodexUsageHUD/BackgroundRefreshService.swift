@@ -622,6 +622,7 @@ enum BackgroundRefreshService {
             return report
         }
         var env = ProcessInfo.processInfo.environment
+        env["CODEX_USAGE_HUD_MANUAL_REFRESH"] = "1"
         env["CODEX_USAGE_HUD_STATE_DIR"] = paths.stateDirectory.path
         env["BLOOM_USAGE_BIN_DIR"] = paths.supportDirectory.appendingPathComponent("bin").path
         env["PATH"] = [
@@ -723,6 +724,7 @@ enum BackgroundRefreshService {
             return report
         }
         var env = ProcessInfo.processInfo.environment
+        env["CODEX_USAGE_HUD_MANUAL_REFRESH"] = "1"
         env["CODEX_USAGE_HUD_STATE_DIR"] = paths.stateDirectory.path
         env["BLOOM_USAGE_BIN_DIR"] = paths.supportDirectory.appendingPathComponent("bin").path
         env["PATH"] = [

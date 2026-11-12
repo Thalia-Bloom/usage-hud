@@ -3,14 +3,6 @@ import Foundation
 enum UsageStore {
     static let providers = ProviderCatalog.ids
 
-    static func loadSnapshots() throws -> [UsageSnapshot] {
-        let result = loadSnapshotResult()
-        if let firstError = result.errors.first, result.snapshots.isEmpty {
-            throw UsageStoreError.loadFailed(firstError)
-        }
-        return result.snapshots
-    }
-
     static func loadSnapshotResult() -> UsageLoadResult {
         let decoder = JSONDecoder()
         let fm = FileManager.default
@@ -56,13 +48,6 @@ enum UsageStore {
     private static let snapshotCache = FileSignatureCache<Result<UsageSnapshot, Error>>()
     private static let healthCache = FileSignatureCache<UsageSnapshot.ProviderHealth?>()
 
-    static var snapshotDecodeCount: Int { snapshotCache.loads }
-
-    static func resetSnapshotCache() {
-        snapshotCache.removeAll()
-        healthCache.removeAll()
-    }
-
     private static func cachedSnapshot(at path: URL, decoder: JSONDecoder) -> Result<UsageSnapshot, Error> {
         snapshotCache.value(for: path) { url in
             Result {
@@ -76,9 +61,24 @@ enum UsageStore {
     }
 
     private static func newestExistingPath(for provider: String, fileManager fm: FileManager) -> URL? {
-        candidates(for: provider).filter { fm.fileExists(atPath: $0.path) }.max { a, b in
-            modificationDate(a, fileManager: fm) < modificationDate(b, fileManager: fm)
+        let existing = candidates(for: provider).filter { fm.fileExists(atPath: $0.path) }
+        if provider == "claude",
+           let native = existing.first(where: { $0.lastPathComponent == UsagePaths.claudeNativeUsageFilename }),
+           let status = loadProviderHealth(filenames: ["claude-official-status.json"], decoder: JSONDecoder(), fileManager: fm),
+           let bgStatus = status.status?.lowercased(), ["keychain_locked", "no_credential"].contains(bgStatus),
+           let nativeSnap = try? cachedSnapshot(at: native, decoder: JSONDecoder()).get(),
+           let nativeStatus = nativeSnap.officialUsageStatus?.status?.lowercased() {
+            let sharedSnap = existing.first { $0.lastPathComponent != UsagePaths.claudeNativeUsageFilename }
+                .flatMap { try? cachedSnapshot(at: $0, decoder: JSONDecoder()).get() }
+            if nativeStatus == "ok", (UsageInsights.readingDate(nativeSnap) ?? .distantPast) > (sharedSnap.flatMap(UsageInsights.readingDate) ?? .distantPast) {
+                return native
+            }
+            if bgStatus == "keychain_locked", nativeStatus != "keychain_locked",
+               (UsageInsights.parseDate(nativeSnap.officialUsageStatus?.updatedAt) ?? .distantPast) >= (UsageInsights.parseDate(status.updatedAt) ?? .distantPast) {
+                return native
+            }
         }
+        return existing.max { modificationDate($0, fileManager: fm) < modificationDate($1, fileManager: fm) }
     }
 
     private static func candidates(for provider: String) -> [URL] {
@@ -122,24 +122,12 @@ enum UsageStore {
         return nil
     }
 
-    static func dropExpiredWindows(
-        _ snapshot: UsageSnapshot,
-        now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> UsageSnapshot {
+    static func dropExpiredWindows(_ snapshot: UsageSnapshot, now: Date = Date(), calendar: Calendar = .current) -> UsageSnapshot {
         var cleaned = snapshot
-        cleaned.currentSession = cleaned.currentSession.map {
-            windowPreservingExpiredState($0, now: now, calendar: calendar)
-        }
-        cleaned.week = cleaned.week.map {
-            windowPreservingExpiredState($0, now: now, calendar: calendar)
-        }
-        cleaned.weekFable = cleaned.weekFable.map {
-            windowPreservingExpiredState($0, now: now, calendar: calendar)
-        }
-        cleaned.windows = cleaned.windows.map {
-            windowPreservingExpiredState($0, now: now, calendar: calendar)
-        }
+        cleaned.currentSession = cleaned.currentSession.map { windowPreservingExpiredState($0, now: now, calendar: calendar) }
+        cleaned.week = cleaned.week.map { windowPreservingExpiredState($0, now: now, calendar: calendar) }
+        cleaned.weekFable = cleaned.weekFable.map { windowPreservingExpiredState($0, now: now, calendar: calendar) }
+        cleaned.windows = cleaned.windows.map { windowPreservingExpiredState($0, now: now, calendar: calendar) }
         return cleaned
     }
 
@@ -181,15 +169,15 @@ enum UsageStore {
     }
 }
 
-enum UsageStoreError: LocalizedError {
-    case loadFailed(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .loadFailed(let detail):
-            return detail
-        }
-    }
+fileprivate func readTail(_ url: URL, maxBytes: Int) -> String? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    let size = (try? handle.seekToEnd()) ?? 0
+    let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+    try? handle.seek(toOffset: offset)
+    var text = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self)
+    if offset > 0, let nl = text.firstIndex(of: "\n") { text = String(text[text.index(after: nl)...]) }
+    return text
 }
 
 enum CodexSessionReader {
@@ -320,20 +308,6 @@ enum CodexSessionReader {
         }
 
         return files.sorted { $0.modificationDate > $1.modificationDate }
-    }
-
-    private static func readTail(_ url: URL, maxBytes: Int) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        try? handle.seek(toOffset: offset)
-        let data = handle.readDataToEndOfFile()
-        var text = String(decoding: data, as: UTF8.self)
-        if offset > 0, let firstNewline = text.firstIndex(of: "\n") {
-            text = String(text[text.index(after: firstNewline)...])
-        }
-        return text
     }
 
     private static func snapshot(from event: CodexEvent, rate: CodexEvent.RateLimits, path: String) -> UsageSnapshot {
@@ -728,24 +702,6 @@ private enum GeminiSessionReader {
             extraUsage: "sample today \(formatCompact(todayTotal)) · 7d \(formatCompact(weekTotal))",
             sourcePath: files.first?.path
         )
-    }
-
-    private static func readTail(_ url: URL, maxBytes: Int) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        try? handle.seek(toOffset: offset)
-        let data = handle.readDataToEndOfFile()
-        var text = String(decoding: data, as: UTF8.self)
-        if offset > 0, let firstNewline = text.firstIndex(of: "\n") {
-            text = String(text[text.index(after: firstNewline)...])
-        }
-        return text
-    }
-
-    private static func modDate(_ url: URL) -> Date? {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
     }
 
     private static func formatCompact(_ n: Int) -> String {

@@ -109,7 +109,6 @@ struct TokenLogFile: Equatable, Sendable {
     var fileKey: Int = 0
 
     var start: Date? { events.first?.at }
-    var lastActive: Date? { events.map(\.at).max() }
 }
 
 // MARK: - Project names

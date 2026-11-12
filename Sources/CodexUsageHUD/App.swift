@@ -110,23 +110,10 @@ enum SnapshotRenderer {
 
 @MainActor
 enum GlyphSnapshot {
-    private static func lane(_ name: String, _ used: Double?, _ mode: String) -> GlyphLane {
-        GlyphLane(name: name, usedPct: used, mode: mode, isConnected: used != nil)
-    }
-
-    // Representative fleet states the menu bar actually shows: calm week,
-    // a low-percent ladder (0/10/20/30/39), mixed pressure, everything hot,
-    // a lanes-missing morning, one lane, and the widest eight-lane fleet.
-    private static let cases: [[GlyphLane]] = [
-        [lane("Claude", 28, "green"), lane("Fable", 39, "green"), lane("Codex", 12, "green"), lane("Gemini", 4, "green"), lane("Grok", 55, "green")],
-        [lane("Claude", 0, "green"), lane("Fable", 10, "green"), lane("Codex", 20, "green"), lane("Gemini", 30, "green"), lane("Grok", 39, "green")],
-        [lane("Claude", 71, "yellow"), lane("Fable", 64, "yellow"), lane("Codex", 88, "orange"), lane("Gemini", 30, "green"), lane("Grok", nil, "unknown")],
-        [lane("Claude", 97, "red"), lane("Fable", 92, "red"), lane("Codex", 100, "freeze"), lane("Gemini", 84, "orange"), lane("Grok", 76, "yellow")],
-        [lane("Claude", 0, "green"), lane("Fable", nil, "unknown"), lane("Codex", nil, "unknown"), lane("Gemini", nil, "unknown"), lane("Grok", nil, "unknown")],
-        [lane("Codex", 46, "green")],
-        [lane("Claude", 22, "green"), lane("Fable", 35, "green"), lane("Codex", 61, "yellow"), lane("Gemini", 8, "green"),
-         lane("Grok", 50, "green"),
-         GlyphLane(name: "Local Models", usedPct: nil, mode: "local", isConnected: true)],
+    // The gauge's states: plenty of room, running hot, almost spent, just
+    // came back, an empty plan, and no reading yet.
+    private static let cases: [(left: Double?, tone: CalmTone)] = [
+        (53, .calm), (38, .hot), (8, .spent), (96, .back), (0, .spent), (nil, .dim),
     ]
 
     /// Renders every case on a dark and a light menu-bar strip, next to the
@@ -134,7 +121,7 @@ enum GlyphSnapshot {
     /// `CODEX_USAGE_HUD_GLYPH_SCALE` sets pixels per point (1, 2 or 3).
     static func render(to path: String) {
         let scale = ProcessInfo.processInfo.environment["CODEX_USAGE_HUD_GLYPH_SCALE"].flatMap { Double($0) }.map { CGFloat($0) } ?? 3
-        let rowH: CGFloat = 24, pad: CGFloat = 10, colW: CGFloat = 110, rowGap: CGFloat = 6
+        let rowH: CGFloat = 24, pad: CGFloat = 10, colW: CGFloat = 150, rowGap: CGFloat = 6
         let W = pad * 3 + colW * 2
         let H = pad * 2 + (rowH + rowGap) * CGFloat(cases.count) - rowGap
 
@@ -157,8 +144,8 @@ enum GlyphSnapshot {
             NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(symbolConfig)
         }
 
-        for (row, lanes) in cases.enumerated() {
-            let img = UsageStatusIcon.image(lanes: lanes)
+        for (row, gauge) in cases.enumerated() {
+            let img = UsageStatusIcon.image(left: gauge.left, tone: gauge.tone)
             let y = H - pad - rowH * CGFloat(row + 1) - rowGap * CGFloat(row)
             for (column, isDark) in [true, false].enumerated() {
                 let colX = pad + (colW + pad) * CGFloat(column)

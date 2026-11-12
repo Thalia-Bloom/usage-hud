@@ -1,14 +1,6 @@
 import AppKit
 import SwiftUI
 
-// ============================================================================
-//  Usage HUD — verdict-first panel
-//  Redesign 2026-06-01 (Apollo): opens to ONE answer ("can I afford heavy work
-//  right now?") instead of a tab bar of equal-weight sections. Hero = the
-//  binding-constraint headroom + operating mode; trio = 3 providers at a glance;
-//  everything the old panel showed lives below the ▾ fold. Data layer untouched.
-// ============================================================================
-
 struct UsageView: View {
     @ObservedObject var state: UsageState
     @AppStorage(PanelMetrics.expandedKey) private var detailsExpanded = false
@@ -60,8 +52,7 @@ struct UsageView: View {
                     } else if !setupOnly {
                         // Reset pings live on each lane's bell; the full card
                         // (history, explanation) moved to Settings.
-                        StatusPanel(state: state, mode: heroMode, tagline: hero.tagline, alternative: heroAlternative,
-                                    primary: primaryBudgetSnapshot, verdictCoversPrimaryAge: heroMode.raw == "check")
+                        CalmPanel(state: state)
                             .padding(.horizontal, HUD.lg)
 
                         if state.snapshots.contains(where: { detailProviders.contains($0.provider.lowercased()) }) {
@@ -148,11 +139,6 @@ struct UsageView: View {
                 HUD.base.opacity(0.84)
                 LinearGradient(colors: [Color.white.opacity(0.04), Color.clear], startPoint: .top, endPoint: .center)
                     .allowsHitTesting(false)
-                RadialGradient(
-                    colors: [heroMode.color.opacity(0.10), Color.clear],
-                    center: .init(x: 0.2, y: 0.02), startRadius: 4, endRadius: 260
-                )
-                .allowsHitTesting(false)
             }
         )
         .overlay(
@@ -187,109 +173,20 @@ struct UsageView: View {
     private var detailProviders: [String] {
         presentationSorted(UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets))
     }
-
-    // Anchor the daily/horizon budget to Claude — it's the primary spend lane and
-    // what "my daily budget" means to most people, so the strip stays stable instead
-    // of jumping providers. The hero separately tracks the cross-provider tightest;
-    // every provider's own TODAY room is in its detail card.
-    private var primaryBudgetSnapshot: UsageSnapshot? {
-        let visible = Set(detailProviders)
-        let visibleSnapshots = state.snapshots.filter { visible.contains($0.provider.lowercased()) }
-        let claude = visible.contains("claude") ? UsageInsights.snapshot(for: "claude", in: visibleSnapshots) : nil
-        if let claude, claude.week != nil || claude.currentSession != nil { return claude }
-        if let b = bindingConstraint(visibleSnapshots) {
-            return UsageInsights.snapshot(for: b.provider, in: visibleSnapshots)
-        }
-        return claude ?? visibleSnapshots.first
-    }
-
-    // Verdict follows the primary lane (Claude when shown). Other lanes are
-    // surfaced by the low-lane warning + offload nudge, so a tight secondary
-    // lane no longer makes the whole HUD read "WATCH" when the work you're
-    // doing is actually fine. HeroVerdict names the lane, needs its own
-    // reading to be fresh for a GO, and never shows GO beside a lane that is
-    // running hot.
-    private var hero: HeroVerdict.Result {
-        guard let snap = primaryBudgetSnapshot else {
-            return HeroVerdict.resolve(mode: "unknown", laneName: nil, readingFresh: false, paceStatus: nil)
-        }
-        let raw: String
-        if let m = state.budgets[snap.provider.lowercased()]?.mode { raw = m }
-        else if let p = pressWindow(snap) { raw = BudgetEvaluator.fallbackModeFromHeadroom(p.headroom) }
-        else { raw = "unknown" }
-        let reading = HeroVerdict.reading(for: snap)
-        return HeroVerdict.resolve(
-            mode: raw,
-            laneName: UsageInsights.label(for: snap.provider.lowercased()),
-            readingFresh: reading.fresh,
-            paceStatus: lanePace(snap).status,
-            staleReason: reading.why
-        )
-    }
-
-    private var heroMode: ModeStyle { ModeStyle(hero.mode) }
-
-    /// "Codex has room · 22% used" under a WATCH/STOP verdict: the next move.
-    private var heroAlternative: String? {
-        let lanes: [HeroVerdict.Lane] = detailProviders.compactMap { provider in
-            guard provider != "local",
-                  !UsageInsights.isManualObservationLane(provider, snapshots: state.snapshots),
-                  let snap = UsageInsights.snapshot(for: provider, in: state.snapshots) else { return nil }
-            let pace = lanePace(snap)
-            // Only point at a lane whose number is current: not old, no
-            // refresh problem, and read within the last half hour.
-            let fresh = UsageInsights.laneFreshness(for: snap)
-            return HeroVerdict.Lane(
-                name: UsageInsights.label(for: provider),
-                used: pace.historical || pace.derived ? nil : pace.used,
-                paceStatus: pace.status,
-                fresh: !fresh.needsAttention && (fresh.age ?? .infinity) <= 30 * 60
-                    && UsageInsights.isReadingFresh(snap, within: 30 * 60)
-            )
-        }
-        let primary = primaryBudgetSnapshot.map { UsageInsights.label(for: $0.provider.lowercased()) }
-        return HeroVerdict.alternative(mode: hero.mode, primary: primary, lanes: lanes)
-    }
 }
 
 // MARK: - Header
 
 func headerHasHealthWarning(_ snapshot: UsageSnapshot, now: Date = Date()) -> Bool {
     if snapshot.health?.isWarning == true { return true }
-
-    // A durable auth failure needs a human no matter how fresh the tap-fed
-    // windows are: an unauthorized or missing credential means the official
-    // Fable/weekly reading cannot come back on its own, so the live-window
-    // bypass below must not hide it. Every other non-ok status (offline,
-    // rate_limited, unparsed, aborted, unsettled, failed) still gets that
-    // bypass, since those can clear themselves once the endpoint or the
-    // scrape recovers.
+    // Durable auth/Keychain issues need attention even while tap windows are live.
     if let officialStatus = snapshot.officialUsageStatus?.status?.lowercased(),
-       ["unauthorized", "no_credential", "token_expired"].contains(officialStatus) {
+       ["unauthorized", "no_credential", "token_expired", "keychain_locked"].contains(officialStatus) {
         return true
     }
-
-    // A live 5h/week window (event within the last 15 minutes) already
-    // proves the pipeline is working, but only reaches this check when the
-    // writer-computed `health` above was not itself a warning, and when the
-    // official status check above did not already return true. Precedence
-    // runs health first, the durable-auth check second, the live-window
-    // bypass third, never in any other order: a warning the writer actually
-    // reported always flags the header, and a revoked token always flags it
-    // too. The keepalive writer now reports health fresh whenever the tap
-    // event is under 15 minutes old, so in practice health and the bypass
-    // rarely disagree; this bypass matters for the remaining case, where
-    // health is absent or stale rather than an active warning. Don't let a
-    // failed official refetch that is not a durable auth failure (endpoint
-    // offline, still unparsed) flag the header while the tap is still
-    // current. The detail card's health line still shows it.
     if UsageInsights.hasLiveWindow(for: snapshot, now: now) { return false }
-
     if snapshot.officialUsageStatus?.isWarning == true { return true }
     guard snapshot.providerHealth?.isWarning == true else { return false }
-
-    // Match the detail-card reconciliation rule: a newer healthy official
-    // result clears an older legacy warning instead of keeping the header red.
     if let official = snapshot.officialUsageStatus, !official.isWarning,
        let officialAt = UsageInsights.parseDate(official.updatedAt),
        let providerAt = UsageInsights.parseDate(snapshot.providerHealth?.updatedAt),
@@ -313,25 +210,44 @@ private struct HeaderBar: View {
                 }
             }
             Spacer()
-            let status = headerStatus
-            HStack(spacing: 5) {
-                BreathingDot(color: statusColor(status))
-                Text(status.text)
-                    .font(.system(size: 10.5, weight: .semibold)).tracking(0.2)
-                    .foregroundStyle(HUD.ink2)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            let status = headerStatus, target = attentionProvider
+            let clickable = target != nil && status.tone == .attention
+            Group {
+                if let target, clickable {
+                    Button(action: { state.toggleRecovery(for: target) }) { statusChip(status, clickable: true) }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("usage.header.recovery")
+                } else {
+                    statusChip(status, clickable: false)
+                }
             }
-            .padding(.horizontal, 9).padding(.vertical, 4)
-            .background(Capsule().fill(Color.white.opacity(0.05)))
-            .overlay(Capsule().strokeBorder(HUD.hair, lineWidth: 0.5))
-            // A new identity per text: the live panel kept the old width when
-            // "Claude · old" became "Claude · sign in again" and clipped it.
-            .id(status.text)
-            .layoutPriority(1)
-            .help(status.help + "\n" + refreshedLine)
+            .id(status.text).layoutPriority(1)
+            .help(status.help + (clickable ? "\nClick for recovery steps." : "") + "\n" + refreshedLine)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Readings: \(LaneSpeech.words(status.text))")
+        }
+    }
+
+    private func statusChip(_ status: HeaderStatus, clickable: Bool) -> some View {
+        HStack(spacing: 5) {
+            BreathingDot(color: statusColor(status))
+            Text(status.text)
+                .font(.system(size: 10.5, weight: .semibold)).tracking(0.2)
+                .foregroundStyle(clickable ? HUD.watch : HUD.ink2)
+                .underline(clickable, color: HUD.watch.opacity(0.75))
+                .lineLimit(1).truncationMode(.middle)
+        }
+        .padding(.horizontal, 9).padding(.vertical, 4)
+        .background(Capsule().fill(Color.white.opacity(0.05)))
+        .overlay(Capsule().strokeBorder(HUD.hair, lineWidth: 0.5))
+        .contentShape(Capsule())
+    }
+
+    private var attentionProvider: String? {
+        UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets).first { p in
+            guard !UsageInsights.isManualObservationLane(p, snapshots: state.snapshots),
+                  let snap = UsageInsights.snapshot(for: p, in: state.snapshots) else { return false }
+            return UsageInsights.laneFreshness(for: snap).needsAttention
         }
     }
 
@@ -373,108 +289,284 @@ private struct HeaderBar: View {
     }
 }
 
-// MARK: - Hero verdict
+// MARK: - Calm panel (headline, one row per plan, weekly win)
 
-/// Hero verdict + lanes. The plain-English verdict ("Claude: clear to build")
-/// is the focal point — big, bright, first thing read. It is Claude's
-/// verdict specifically (the primary spend lane), not a blanket "everything
-/// is fine": a GO only shows when Claude's own reading is under 15 minutes
-/// old, falling back to a neutral CHECK otherwise. The tightest binding
-/// window sits under it; then each lane as a bar row in its own identity color.
-private struct StatusPanel: View {
+/// Glyph's B plus C panel: the answer in plain words, then one row per plan
+/// with the most room on top. One row is open at a time and the top row opens
+/// by default. The rules live in CalmPanel.swift.
+private struct CalmPanel: View {
     @ObservedObject var state: UsageState
-    let mode: ModeStyle
-    let tagline: String
-    let alternative: String?
-    let primary: UsageSnapshot?
-    /// The verdict line already names the primary lane's old reading, so
-    /// the caveat below it doesn't repeat it.
-    var verdictCoversPrimaryAge = false
+    @ObservedObject var comeBack = ComeBack.shared
+    @State private var openID: String?
+    /// Bumped when a row's window pin changes, so the rows re-read it.
+    @State private var pinRevision = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private struct Item { let lane: CalmLane; let snap: UsageSnapshot; let pace: LanePace; let fresh: LaneFreshness }
 
     var body: some View {
+        let _ = pinRevision
+        let items = self.items
+        let lanes = items.map(\.lane)
+        let back = lanes.first { $0.tone == .back && comeBack.back($0.id)?.seen == false }
+        let head = CalmHeadline.make(lanes, back: back)
+        let open = openID ?? lanes.first?.id
+        let headTarget: String? = lanes.allSatisfy({ !$0.tone.usable })
+            ? (items.first(where: { $0.fresh.needsAttention })?.lane.id ?? providers.first(where: { p in !items.contains { $0.lane.id == p } }))
+            : nil
+        let subTarget: String? = headTarget == nil && head.sub?.contains("fresh reading") == true
+            ? items.first(where: { $0.lane.tone == .dim && $0.fresh.needsAttention })?.lane.id : nil
+        let blockTarget = headTarget ?? subTarget
         VStack(alignment: .leading, spacing: HUD.md) {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .center, spacing: 10) {
-                    VerdictPill(mode: mode)
-                        .help(whyHelp)
-                    Text(tagline)
-                        .font(.system(size: 19, weight: .semibold, design: .rounded))
-                        .foregroundStyle(HUD.ink)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.75)
-                    Spacer(minLength: 0)
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(mode.spokenWord). \(tagline)")
-                if let alternative {
-                    HStack(alignment: .center, spacing: 6) {
-                        Image(systemName: "arrow.turn.down.right")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(HUD.go)
-                            .accessibilityHidden(true)
-                        Text(alternative)
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundStyle(HUD.ink2)
-                        Spacer(minLength: 0)
-                    }
-                    .help("Another lane you pay for has room right now. Switch to it while this one recovers.")
-                }
-                if let caveat = UsageInsights.trustCaveat(snapshots: state.snapshots, budgets: state.budgets,
-                                                          excluding: caveatExclusions) {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Circle().fill(HUD.watch).frame(width: 5, height: 5)
-                            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 3.5 }
-                            .accessibilityHidden(true)
-                        Text(noWidow(caveat))
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(HUD.ink3)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 0)
-                    }
-                    .help("Each lane says where its number came from. A reading marked old stopped refreshing, so it describes the past, not right now.")
+            VStack(alignment: .leading, spacing: 5) {
+                Text(head.title)
+                    .font(.system(size: 25, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
+                    .underline(headTarget != nil, color: HUD.ink3)
+                    .lineLimit(1).minimumScaleFactor(0.7)
+                if let sub = head.sub {
+                    Text(noWidow(sub))
+                        .font(.system(size: 12.5, weight: .medium)).foregroundStyle(subTarget != nil ? HUD.watch : HUD.ink2)
+                        .underline(subTarget != nil, color: HUD.watch.opacity(0.75))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .contentShape(Rectangle())
+            .onTapGesture { if let blockTarget { state.toggleRecovery(for: blockTarget) } }
+            .help(blockTarget != nil ? "Click for recovery steps." : "")
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(blockTarget != nil ? [.isHeader, .isButton] : .isHeader)
+            if let active = state.activeRecoveryProvider, let recovery = activeRecovery(for: active) {
+                LaneRecoveryCard(recovery: recovery, state: state)
+            }
             FoundProviderBanner()
-            LaneBars(state: state, pings: state.resetPings,
-                     primaryProvider: primary?.provider.lowercased(), accent: mode.color)
-                .padding(.top, 2)
-                .overlay(Rectangle().fill(HUD.hair).frame(height: 0.5), alignment: .top)
-            SpendValueLine(state: state)
+            VStack(spacing: 2) {
+                ForEach(items, id: \.lane.id) { item in
+                    CalmRow(lane: item.lane, snap: item.snap, pace: item.pace, fresh: item.fresh, open: item.lane.id == open,
+                            pings: ResetPingController.providers.contains(item.lane.id) ? state.resetPings : nil,
+                            pin: { UserDefaults.standard.set($0, forKey: "hud.laneWindow.\(item.lane.id)"); pinRevision += 1 },
+                            onRecover: { state.toggleRecovery(for: item.lane.id) }) {
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                            openID = item.lane.id == open ? "" : item.lane.id
+                        }
+                    }
+                }
+                ForEach(providers.filter { p in !items.contains { $0.lane.id == p } }, id: \.self) { provider in
+                    EmptyLaneRow(provider: provider) { state.toggleRecovery(for: provider) }
+                }
+            }
+            .padding(.horizontal, -10)
+            .animation(SnapshotMode.enabled || reduceMotion ? nil : .easeOut(duration: 0.35), value: lanes.map(\.id))
+            WeeklyWin(state: state)
             PingStrip(controller: state.resetPings)
         }
     }
 
-    private var caveatExclusions: Set<String> {
-        guard verdictCoversPrimaryAge, let p = primary?.provider.lowercased() else { return [] }
-        return [p]
+    private func activeRecovery(for provider: String) -> LaneRecovery? {
+        let snap = UsageInsights.snapshot(for: provider, in: state.snapshots)
+        let fresh = UsageInsights.laneFreshness(for: snap)
+        return LaneRecovery.make(provider: provider, snapshot: snap, freshness: fresh)
     }
 
-    // The old "Why:" line, demoted to hover: which window drives the verdict
-    // plus what this mode allows (ModeStyle.reassure).
-    private var whyHelp: String {
-        var parts: [String] = [mode.reassure]
-        if let snap = primary, let p = pressWindow(snap) {
-            let reset = shortReset(p.reset, nil).map { ", resets \($0)" } ?? ""
-            parts.append("Based on the \(UsageInsights.label(for: snap.provider)) \(p.label) limit: \(formatPercent(100 - p.headroom)) used\(reset).")
+    private var providers: [String] {
+        UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets).filter { $0 != "local" }
+    }
+
+    private var items: [Item] {
+        let built: [Item] = providers.compactMap { p in
+            guard let snap = UsageInsights.snapshot(for: p, in: state.snapshots) else { return nil }
+            let pin = UserDefaults.standard.string(forKey: "hud.laneWindow.\(p)") ?? "auto"
+            let pace = lanePace(snap, forced: pin == "auto" ? nil : pin)
+            let fresh = UsageInsights.laneFreshness(for: snap)
+            let window = pace.windowTag == "5h" ? snap.currentSession : snap.week
+            let lane = CalmLane(id: p, name: UsageInsights.label(for: p), used: pace.used,
+                                tone: CalmTone.make(pace, old: fresh.isOld, back: comeBack.back(p) != nil),
+                                reset: window.flatMap(rowReset))
+            return Item(lane: lane, snap: snap, pace: pace, fresh: fresh)
         }
-        return parts.joined(separator: "\n")
+        let order = CalmHeadline.sorted(built.map(\.lane)).map(\.id)
+        return built.sorted { (order.firstIndex(of: $0.lane.id) ?? 0) < (order.firstIndex(of: $1.lane.id) ?? 0) }
     }
 }
 
-private struct VerdictPill: View {
-    let mode: ModeStyle
+private func rowReset(_ w: UsageSnapshot.WindowMetric) -> String? {
+    let now = Date()
+    return calmRowReset(UsageInsights.resetDate(for: w, now: now), label: w.resetLabel, now: now)
+}
+
+/// The row's reset column, short enough that it never truncates: "in 2h 10m"
+/// when close, "Wed 4:27 AM" inside a week, the date alone ("Nov 18") 7 or
+/// more days out, or when the weekday would read as today's.
+func calmRowReset(_ date: Date?, label: String?, now: Date) -> String? {
+    guard let date else { return label }
+    let remaining = date.timeIntervalSince(now)
+    if remaining > 0, remaining <= 3 * 3600 { return "in \(countdownText(remaining))" }
+    let calendar = Calendar.current
+    let sameWeekdayLater = !calendar.isDate(date, inSameDayAs: now)
+        && calendar.component(.weekday, from: date) == calendar.component(.weekday, from: now)
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    if remaining >= 7 * 24 * 3600 || sameWeekdayLater {
+        f.dateFormat = "MMM d"
+    } else {
+        f.dateFormat = Calendar.current.component(.minute, from: date) == 0 ? "EEE h a" : "EEE h:mm a"
+    }
+    return f.string(from: date)
+}
+
+/// One plan: name, bar, percent used, reset. Gray unless the plan needs a
+/// look; the pace tick shows where even use would be by now. When the plan
+/// comes back the bar drains, turns green and a light sweeps it once.
+private struct CalmRow: View {
+    let lane: CalmLane
+    let snap: UsageSnapshot
+    let pace: LanePace
+    let fresh: LaneFreshness
+    let open: Bool
+    var pings: ResetPingController?
+    /// Pins the row to "auto" (closest to running out), "5h" or "wk".
+    var pin: (String) -> Void = { _ in }
+    var onRecover: () -> Void = {}
+    let toggle: () -> Void
+    @State private var shown: Double = 0
+    @State private var draining = false
+    @State private var sweep: CGFloat = -0.2
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var still: Bool { SnapshotMode.enabled || reduceMotion }
+    private var window: UsageSnapshot.WindowMetric? { pace.windowTag == "5h" ? snap.currentSession : snap.week }
+
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: mode.icon).font(.system(size: 10.5, weight: .bold))
-            Text(mode.word).font(.system(size: 12.5, weight: .heavy, design: .rounded)).tracking(0.6)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                Text(lane.name)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(HUD.ink)
+                    .lineLimit(1)
+                    .frame(width: 62, alignment: .leading)
+                PremiumBar(fraction: shown / 100, color: draining ? HUD.stop : barColor,
+                           marker: lane.tone == .dim ? nil : pace.elapsed.map { $0 / 100 })
+                    .overlay(sweepBand)
+                Text(lane.used.map { formatPercent($0) } ?? "--")
+                    .font(.system(size: 14.5, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(draining ? HUD.stop : valueColor)
+                    .frame(width: 44, alignment: .trailing)
+                Text(lane.reset ?? "")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(HUD.ink3)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(width: 80, alignment: .trailing)
+            }
+            if open {
+                detail
+            } else if fresh.needsAttention {
+                recoveryLink
+            }
         }
-        .foregroundStyle(mode.onColor)
-        .padding(.horizontal, 11).padding(.vertical, 5)
-        .background(Capsule().fill(mode.color))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+        .padding(.horizontal, 10)
+        .padding(.vertical, open ? 10 : 8)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(open ? 0.05 : 0)))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: toggle)
+        .help(rowTooltip)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(LaneSpeech.lane(name: lane.name, pace: pace,
+                                            resetSpoken: laneResetSpoken(window?.resetLabel, window?.resetAt), freshness: fresh))
+        .accessibilityAddTraits(.isButton)
+        .modifier(BellAction(pings: pings, provider: lane.id))
+        .contextMenu {
+            Button("Show the closest limit") { pin("auto") }
+            Button("Show the 5-hour limit") { pin("5h") }
+            Button("Show the weekly limit") { pin("wk") }
+        }
+        .accessibilityAction(named: "Show the 5-hour limit") { pin("5h") }
+        .accessibilityAction(named: "Show the weekly limit") { pin("wk") }
+        .accessibilityAction(named: "Show the closest limit") { pin("auto") }
+        .onAppear(perform: start)
+        .onChange(of: lane.used) { _, used in withAnimation(still ? nil : .easeOut(duration: 0.5)) { shown = used ?? 0 } }
     }
-}
 
+    @ViewBuilder private var detail: some View {
+        let lines = LaneLines.make(pace, todayNote: nil, note: CreditsDisplay.laneNote(snap.credits), freshness: fresh)
+        let fable = lane.id == "claude" && FableDisplay.shouldShow(week: snap.weekFable, expired: false)
+            ? FableDisplay.make(week: snap.weekFable, expired: false).usedPct : nil
+        let text = CalmHeadline.detail(lines, status: pace.status,
+                                       age: (fresh.age ?? 0) > 15 * 60 && !fresh.isOld ? fresh.ageShort : nil,
+                                       fable: fable.map { formatPercent($0) })
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if fresh.needsAttention {
+                recoveryLink
+            } else {
+                (Text(text.head.map { "\($0). " } ?? "").foregroundStyle(headColor).fontWeight(.semibold)
+                 + Text(text.rest).foregroundStyle(HUD.ink2))
+                    .font(.system(size: 12, weight: .medium))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if let pings { PingBell(controller: pings, provider: lane.id) }
+        }
+    }
+
+    private var recoveryLink: some View {
+        let agePart = fresh.isOld ? fresh.ageShort.map { "Last read \($0) ago" } : nil
+        let issuePart = fresh.issue.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? (fresh.isOld ? "How to fix" : "Check reading")
+        return Button(action: onRecover) {
+            Text([agePart, issuePart].compactMap { $0 }.joined(separator: " · "))
+                .font(.system(size: 11.5, weight: .medium)).foregroundStyle(HUD.watch)
+                .underline(true, color: HUD.watch.opacity(0.75))
+                .fixedSize(horizontal: false, vertical: true).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("usage.lane.\(lane.id).recovery")
+    }
+
+    private var rowTooltip: String {
+        guard fresh.needsAttention else { return "" }
+        let lead = fresh.isOld ? "Last known reading (\(fresh.ageShort.map { "\($0) ago" } ?? "old")). " : ""
+        return "\(lead)\(fresh.issueDetail ?? fresh.issue ?? "") Click for recovery steps."
+    }
+
+    private var sweepBand: some View {
+        GeometryReader { g in
+            LinearGradient(colors: [.clear, Color.white.opacity(0.65), .clear], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 40)
+                .offset(x: sweep * g.size.width - 20)
+        }
+        .mask(Capsule())
+        .allowsHitTesting(false)
+    }
+
+    private func start() {
+        let target = lane.used ?? 0
+        guard lane.tone == .back, !still, let mark = ComeBack.shared.back(lane.id), !mark.played else {
+            if still { shown = target } else { withAnimation(.easeOut(duration: 0.9).delay(0.2)) { shown = target } }
+            return
+        }
+        shown = mark.before ?? 100
+        draining = true
+        withAnimation(.easeInOut(duration: 0.8)) { shown = target }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            draining = false
+            withAnimation(.easeInOut(duration: 0.7)) { sweep = 1.2 }
+            ComeBack.shared.played(lane.id)
+        }
+    }
+
+    private var barColor: Color {
+        switch lane.tone {
+        case .calm: return Color.white.opacity(0.42)
+        case .hot: return HUD.watch
+        case .spent: return HUD.stop
+        case .back: return HUD.go
+        case .dim: return HUD.ink3.opacity(0.5)
+        }
+    }
+
+    private var valueColor: Color { lane.tone == .calm ? HUD.ink : lane.tone == .dim ? HUD.ink3 : barColor }
+    private var headColor: Color { lane.tone == .calm || lane.tone == .dim ? HUD.ink : barColor }
+}
 // MARK: - Bars (one grammar: hero, lanes, windows)
 
 /// Lane bar: a quiet recessed track with a flat fill, plus the pace tick.
@@ -557,207 +649,19 @@ private struct FoundProviderBanner: View {
     }
 }
 
-/// Shared column grid for every lane row, so names, bars, percentages and
-/// bells line up down the panel and sub-lines start under the bar.
-private enum LaneGrid {
-    static let name: CGFloat = 104
-    static let gap: CGFloat = 10
-    static let value: CGFloat = 42
-    static let bell: CGFloat = 16
-    /// Where a lane name's text starts (after its 13pt dot and 7pt gap).
-    static let nameText: CGFloat = 20
-    static var subLead: CGFloat { name + gap }
-    static var subTrail: CGFloat { bell + gap }
-}
-
-/// Every lane as an identical SPEND-vs-CLOCK pace block (Snowflake's
-/// spend/interval pattern): the bar is % of the window spent and the tick is
-/// % of the window's time elapsed. The gap between the two IS the pace
-/// verdict, so a fully-burned lane reads "Spent · back Sun Oct 4, 9 PM"
-/// (target hit under the 100%-utilization policy) instead of a red alarm.
-private struct LaneBars: View {
-    @ObservedObject var state: UsageState
-    @ObservedObject var pings: ResetPingController
-    var primaryProvider: String?
-    var accent: Color = HUD.go
-
-    var body: some View {
-        let lanes = presentationSorted(
-            UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets)
-        )
-        if !lanes.isEmpty {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(lanes.enumerated()), id: \.element) { index, p in
-                    VStack(alignment: .leading, spacing: 10) {
-                        if let snapshot = UsageInsights.snapshot(for: p, in: state.snapshots) {
-                            if p == "local" {
-                                LocalUsageBlock(snapshot: snapshot)
-                            } else {
-                                PaceBlock(provider: p, snapshot: snapshot,
-                                          isPrimary: p == primaryProvider, accent: accent,
-                                          pings: ResetPingController.providers.contains(p) ? pings : nil,
-                                          note: CreditsDisplay.laneNote(snapshot.credits))
-                            }
-                            if p == "claude" {
-                                let fableExpired = snapshot.rateLimitExpired?.contains("weekFable") == true
-                                if FableDisplay.shouldShow(week: snapshot.weekFable, expired: fableExpired) {
-                                    FableRow(week: snapshot.weekFable, expired: fableExpired)
-                                }
-                            }
-                        } else {
-                            EmptyLaneRow(provider: p)
-                        }
-                    }
-                    .padding(.vertical, 11)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .overlay(alignment: .top) {
-                        if index > 0 { Rectangle().fill(HUD.hairSoft).frame(height: 0.5) }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The name a lane row prints. The rows share a fixed name column, and
-/// "Local Models" only fit by shrinking below the other names.
-private func laneTitle(_ provider: String) -> String {
-    provider == "local" ? "Local" : UsageInsights.label(for: provider)
-}
-
-/// The left column of a lane row: identity dot (ringed on the lane that
-/// drives the verdict), the lane name, and an optional trailing accessory.
-private struct LaneName<Accessory: View>: View {
-    let title: String
-    let dot: Color
-    var ring: Color? = nil
-    var small = false
-    @ViewBuilder var accessory: () -> Accessory
-
-    var body: some View {
-        // Explicit gaps: a uniform HStack spacing also padded the spacer,
-        // which left "Claude" too little room beside its window tag.
-        HStack(spacing: 0) {
-            ZStack {
-                if let ring {
-                    Circle().strokeBorder(ring.opacity(0.85), lineWidth: 1.25)
-                        .frame(width: 13, height: 13)
-                }
-                Circle().fill(dot).frame(width: small ? 5 : 7, height: small ? 5 : 7)
-            }
-            .frame(width: 13, height: 13)
-            .padding(.trailing, LaneGrid.nameText - 13)
-            Text(title)
-                .font(.system(size: small ? 11.5 : 13, weight: small ? .medium : .semibold))
-                .foregroundStyle(small ? HUD.ink2 : HUD.ink)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .layoutPriority(1)
-            Spacer(minLength: 4)
-            accessory()
-        }
-        .frame(width: LaneGrid.name, alignment: .leading)
-    }
-}
-
-extension LaneName where Accessory == EmptyView {
-    init(title: String, dot: Color, ring: Color? = nil, small: Bool = false) {
-        self.init(title: title, dot: dot, ring: ring, small: small) { EmptyView() }
-    }
-}
-
-/// Second line of a lane row: where the number came from sits under the
-/// lane's name, and the lane's key fact (reset, stale age) runs under the bar.
-private struct LaneSubline: View {
-    let text: String?
-    var textColor: Color = HUD.ink2
-    /// The lane's freshness note ("updated 25m ago", "not refreshing"),
-    /// from the same `LaneFreshness` the header pill reads.
-    var freshness: LaneFreshness? = nil
-    var trust: UsageInsights.LaneTrust?
-    var indent: CGFloat = 0
-
-    var body: some View {
-        let note = freshness?.note
-        let noteColor = freshness?.needsAttention == true ? HUD.watch : HUD.ink3
-        HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
-            Group {
-                if let trust { TrustTag(trust: trust) } else { Color.clear.frame(height: 1) }
-            }
-            .padding(.leading, LaneGrid.nameText + indent)
-            .frame(width: LaneGrid.name, alignment: .leading)
-            (Text(text ?? "").foregroundStyle(textColor)
-             + Text(text != nil && note != nil ? " · " : "").foregroundStyle(HUD.ink3)
-             + Text(note ?? "").foregroundStyle(noteColor))
-                .font(.system(size: 10.5, weight: .medium))
-                .monospacedDigit()
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 0)
-        }
-        .optionalHelp(freshness?.issueDetail)
-    }
-}
-
-private extension View {
-    /// A tooltip only when there is something to say, so an empty one never
-    /// hides the row's own tooltip.
-    @ViewBuilder func optionalHelp(_ text: String?) -> some View {
-        if let text, !text.isEmpty { self.help(text) } else { self }
-    }
-}
-
-private struct LocalUsageBlock: View {
-    let snapshot: UsageSnapshot
-
-    var body: some View {
-        let today = snapshot.session?.todayTotal ?? 0
-        let week = snapshot.session?.weekTotal ?? 0
-        // Same two-line grammar as the bar lanes: tokens where the bar would
-        // be, provenance under the name.
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
-                LaneName(title: "Local", dot: HUD.local)
-                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
-                (Text(compactTokenCount(today)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
-                 + Text(" tokens today").font(.system(size: 10.5, weight: .medium)).foregroundStyle(HUD.ink2))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            LaneSubline(text: "\(compactTokenCount(week)) this week", textColor: HUD.ink3,
-                        trust: UsageInsights.laneTrust(for: snapshot))
-        }
-        .help("Tokens your local models (Ollama) read and wrote, counted from Ollama's logs on this Mac. Local models have no usage limit.")
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Local models, \(compactTokenCount(today)) tokens today, \(compactTokenCount(week)) this week")
-    }
-}
-
-/// Pure display logic for the Fable row, split out from the view so a missing
-/// reading can never be tested (or accidentally coded) into a false "0%".
-/// The row's only data source is the official weekly "Current week (Fable)"
-/// reading — there is no other fallback source.
+/// Pure display logic for the Fable row (official "Current week (Fable)" only).
 enum FableDisplay {
     struct Result: Equatable {
-        let usedPct: Double?     // nil = no reading; the view must show "--", never 0.
+        let usedPct: Double?
         let percentText: String
         let subline: String
         let helpText: String
-        let elapsedPct: Double?  // % of the weekly window's wall-clock elapsed; nil = no reset time
+        let elapsedPct: Double?
         let trust: UsageInsights.LaneTrust
-        /// The reset part of `subline` alone, so the row can color the age
-        /// note the way every other lane does.
         var resetText: String? = nil
-        /// How current the reading is, in the panel's one vocabulary. Nil
-        /// when there is no reading or it carries no stamp of its own (it
-        /// then rides on the Claude row's freshness).
         var freshness: LaneFreshness? = nil
     }
 
-    /// The keepalive writer refetches the official reading whenever it is
-    /// older than 10 minutes, so past an hour the refetch itself is failing,
-    /// not the panel simply waiting between ticks.
     static let oldAfter: TimeInterval = 60 * 60
 
     static func shouldShow(week: UsageSnapshot.WindowMetric?, expired: Bool) -> Bool {
@@ -808,193 +712,6 @@ enum FableDisplay {
         let subline = [reset, freshness?.note].compactMap { $0 }.joined(separator: " · ")
         return Result(usedPct: pct, percentText: formatPercent(pct), subline: subline, helpText: help,
                       elapsedPct: stale ? nil : elapsed, trust: trust, resetText: reset, freshness: freshness)
-    }
-}
-
-/// Fable rides on the Claude subscription, so it lives as a mini lane row
-/// under Claude — same grid, smaller type, its own red fill. Bar = the
-/// official "Current week (Fable)" limit used %. Hidden entirely (see
-/// FableDisplay.shouldShow) until Fable has ever reported a weekly reading,
-/// so this never claims a reading that doesn't exist.
-private struct FableRow: View {
-    let week: UsageSnapshot.WindowMetric?
-    let expired: Bool
-    @State private var shown: Double = 0
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var display: FableDisplay.Result { FableDisplay.make(week: week, expired: expired) }
-
-    var body: some View {
-        let target = display.usedPct ?? 0
-        let still = SnapshotMode.enabled || reduceMotion
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: LaneGrid.gap) {
-                // Neutral dot: at 0% a red identity dot read as a STOP signal,
-                // so the brand red lives only on the bar fill.
-                LaneName(title: "Fable", dot: HUD.ink3, small: true)
-                    .padding(.leading, 12)
-                    .frame(width: LaneGrid.name, alignment: .leading)
-
-                PremiumBar(fraction: shown / 100, color: HUD.fable, height: 5,
-                           marker: display.elapsedPct.map { $0 / 100 })
-
-                Text(display.percentText)
-                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
-                    .foregroundStyle(display.usedPct == nil ? HUD.ink3 : HUD.ink2)
-                    .monospacedDigit()
-                    .frame(width: LaneGrid.value, alignment: .trailing)
-
-                Color.clear.frame(width: LaneGrid.bell, height: 1)
-            }
-            if !display.subline.isEmpty {
-                LaneSubline(text: display.usedPct == nil ? display.subline : display.resetText,
-                            textColor: HUD.ink3, freshness: display.freshness, trust: display.trust, indent: 12)
-            }
-        }
-        .help(display.helpText)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(LaneSpeech.fable(display, week: week))
-        .onAppear { if still { shown = target } else { withAnimation(.easeOut(duration: 0.9).delay(0.25)) { shown = target } } }
-        .onChange(of: target) { _, _ in if still { shown = target } else { withAnimation(.easeOut(duration: 0.5)) { shown = target } } }
-    }
-}
-
-private struct PaceBlock: View {
-    let provider: String
-    let snapshot: UsageSnapshot?
-    var isPrimary = false
-    var accent: Color = HUD.go
-    var pings: ResetPingController?
-    var note: String?
-    @State private var shown: Double = 0
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    // Per-lane window pin: "auto" (pressing window) / "5h" / "wk".
-    @AppStorage private var pinned: String
-
-    init(provider: String, snapshot: UsageSnapshot?, isPrimary: Bool = false, accent: Color = HUD.go,
-         pings: ResetPingController? = nil, note: String? = nil) {
-        self.provider = provider
-        self.snapshot = snapshot
-        self.isPrimary = isPrimary
-        self.accent = accent
-        self.pings = pings
-        self.note = note
-        _pinned = AppStorage(wrappedValue: "auto", "hud.laneWindow.\(provider)")
-    }
-
-    var body: some View {
-        let pace = lanePace(snapshot, preferPressing: isPrimary, forced: pinned == "auto" ? nil : pinned)
-        let freshness = UsageInsights.laneFreshness(for: snapshot)
-        let trust = UsageInsights.displayTrust(for: snapshot, historical: pace.historical, derived: pace.derived)
-        let target = pace.used ?? 0
-        let still = SnapshotMode.enabled || reduceMotion
-        // Daily room comes from the weekly limit, so it only sits beside the
-        // weekly bar; next to a 5-hour reset it read as a 5-hour number.
-        let todayNote = (isPrimary && !freshness.isOld && pace.windowTag != "5h" ? snapshot.flatMap { todayRoom($0) } : nil)
-            .flatMap { $0.rowNote }
-        let lines = LaneLines.make(pace, todayNote: todayNote, note: note, freshness: freshness)
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: LaneGrid.gap) {
-                LaneName(title: laneTitle(provider), dot: pace.barColor,
-                         ring: isPrimary ? accent : nil) {
-                    windowTag(pace)
-                }
-
-                PremiumBar(fraction: shown / 100, color: pace.historical ? HUD.ink3 : pace.barColor,
-                           marker: freshness.isOld ? nil : pace.elapsed.map { $0 / 100 })
-
-                Text(pace.used.map { formatPercent($0) } ?? "--")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .foregroundStyle(pace.used == nil || freshness.isOld || pace.historical ? HUD.ink3 : pace.valueColor)
-                    .monospacedDigit()
-                    .frame(width: LaneGrid.value, alignment: .trailing)
-
-                Group {
-                    if let pings {
-                        PingBell(controller: pings, provider: provider)
-                    } else {
-                        Color.clear.frame(height: 1)
-                    }
-                }
-                .frame(width: LaneGrid.bell)
-            }
-            LaneSubline(text: lines.primary, textColor: lines.primaryIsGap ? HUD.wait : HUD.ink2,
-                        freshness: freshness, trust: trust)
-            if let status = lines.status {
-                Text(status)
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(pace.statusColor)
-                    .lineLimit(1)
-                    .padding(.leading, LaneGrid.subLead)
-            }
-        }
-        .help(rowHelp(pace))
-        // One VoiceOver stop per lane, read the way a person would say it.
-        // The bell and the window switch stay reachable as actions.
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(LaneSpeech.lane(name: UsageInsights.label(for: provider), pace: pace,
-                                            resetSpoken: spokenReset(pace), freshness: freshness))
-        .accessibilityAction(named: "Show \(nextPinName) limit") { cyclePin() }
-        .modifier(BellAction(pings: pings, provider: provider))
-        .onAppear { if still { shown = target } else { withAnimation(.easeOut(duration: 0.9).delay(0.2)) { shown = target } } }
-        .onChange(of: target) { _, _ in if still { shown = target } else { withAnimation(.easeOut(duration: 0.5)) { shown = target } } }
-    }
-
-    /// The shown window's reset, said in full ("Tuesday, October 6 at 6:20 PM").
-    private func spokenReset(_ pace: LanePace) -> String? {
-        guard let snapshot else { return nil }
-        let window = pace.windowTag == "5h" ? snapshot.currentSession : snapshot.week
-        guard let window else { return nil }
-        return laneResetSpoken(window.resetLabel, window.resetAt)
-    }
-
-    private var nextPinName: String {
-        switch pinned {
-        case "auto": return "5-hour"
-        case "5h": return "weekly"
-        default: return "closest"
-        }
-    }
-
-    private func windowTag(_ pace: LanePace) -> some View {
-        Button(action: cyclePin) {
-            Text(pace.windowTag)
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundStyle(pinned == "auto" ? HUD.ink3 : HUD.ink2)
-                .padding(.horizontal, 5).padding(.vertical, 1.5)
-                .background(Capsule().fill(Color.white.opacity(pinned == "auto" ? 0 : 0.09)))
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .help(pinned == "auto"
-              ? "Showing whichever limit is closer to running out. Click to always show the 5-hour limit."
-              : "Always showing the \(pinned == "5h" ? "5-hour" : "weekly") limit. Click to show the \(nextPinName) limit.")
-    }
-
-    private func cyclePin() {
-        switch pinned {
-        case "auto": pinned = "5h"
-        case "5h": pinned = "wk"
-        default: pinned = "auto"
-        }
-    }
-
-    private func rowHelp(_ pace: LanePace) -> String {
-        let freshness = UsageInsights.laneFreshness(for: snapshot)
-        if freshness.isOld {
-            return "This is the last known reading, not a current estimate of available usage. " +
-                (freshness.issueDetail ?? "Open Help for a health check and recovery steps.")
-        }
-        let window = LaneSpeech.windowName(pace.windowTag)
-        var lines: [String] = []
-        if let e = pace.elapsed {
-            lines.append("The bar shows how much of the \(window) you've used. The tick marks how much of its time has passed (\(formatPercent(e))). Behind the tick means room to spare; past it means you're using it faster than it lasts.")
-        } else {
-            lines.append("The bar shows how much of the \(window) you've used. The reset time isn't known, so there's no tick.")
-        }
-        if pace.status == "ON PACE" { lines.append("On pace: your use is keeping up with the clock, not ahead of it.") }
-        if isPrimary { lines.append("The ringed lane sets the verdict at the top. The daily figure is how much you can use each day and still last until the reset.") }
-        return lines.joined(separator: "\n")
     }
 }
 
@@ -1073,7 +790,7 @@ private struct PingBell: View {
             Image(systemName: on ? "bell.fill" : "bell")
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(on ? HUD.ink : (hovering ? HUD.ink2 : HUD.ink3.opacity(0.7)))
-                .frame(width: LaneGrid.bell, height: 16)
+                .frame(width: 16, height: 16)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1131,33 +848,20 @@ private extension String {
 // MARK: - Pace model (spend vs clock)
 
 struct LanePace {
-    let used: Double?       // % of the burn window spent; nil = unknown/expired
-    let elapsed: Double?    // % of the window's wall-clock elapsed; nil = no reset time
-    let windowTag: String   // "wk" / "day" / "5h" — which window the numbers describe
+    let used: Double?
+    let elapsed: Double?
+    let windowTag: String
     let status: String
     let statusColor: Color
     let barColor: Color
     let valueColor: Color
-    let sub: String?        // "back 7:00 PM" / "empty ~4:10 PM"
-    // How old the reading is lives in `LaneFreshness`, not here, so the
-    // row, its tag, the header and the verdict share one clock.
-    var reset: String?      // shown window's reset, canonical short form
-    /// True when `used` is a carried-over last-known reading from before the
-    /// window expired, not a current one — the big percent + bar must render
-    /// dimmed so it can't be mistaken for a live number.
+    let sub: String?
+    var reset: String?
     var historical: Bool = false
-    /// True when `used` is the HUD's own inference rather than a number the
-    /// provider reported. The idle-lane 0% is the case that matters: nothing
-    /// ran, so the window is genuinely clear, but the provider never said
-    /// "0%" and the trust chip must not claim it did.
     var derived: Bool = false
 }
 
 /// Pace verdict for a lane's burn window (week/quota; session fallback).
-/// One rule for every lane: compare % spent against % of the window elapsed.
-/// Under the 100%-utilization policy, ahead-of-clock is "running hot" (you'll
-/// run dry early), behind-of-clock is "room to burn", and a finished lane is
-/// calm success with its comeback time — never an alarm.
 func lanePace(_ snapshot: UsageSnapshot?, preferPressing: Bool = false, forced: String? = nil, now: Date = Date()) -> LanePace {
     guard let snap = snapshot else {
         return LanePace(used: nil, elapsed: nil, windowTag: "", status: "NO DATA", statusColor: HUD.ink3,
@@ -1219,7 +923,7 @@ func lanePace(_ snapshot: UsageSnapshot?, preferPressing: Bool = false, forced: 
         }
         // No reading because the sign-in was refused: say how to fix it.
         if let status = snap.officialUsageStatus?.status?.lowercased(),
-           ["unauthorized", "no_credential", "token_expired"].contains(status) {
+           ["unauthorized", "no_credential", "token_expired", "keychain_locked"].contains(status) {
             return LanePace(used: nil, elapsed: nil, windowTag: tag, status: "WAIT", statusColor: HUD.wait,
                             barColor: HUD.ink3, valueColor: HUD.ink3, sub: "open \(UsageInsights.label(for: snap.provider)) once")
         }
@@ -1289,12 +993,7 @@ func lanePace(_ snapshot: UsageSnapshot?, preferPressing: Bool = false, forced: 
     return pace
 }
 
-/// One canonical reset format everywhere; the date is dropped when it's today
-/// ("back 6:50 PM"), short for this week, full otherwise. Falls back to the
-/// raw upstream label when unparseable.
-/// Lays children out left to right and wraps to a new row when the next one
-/// would not fit, each row vertically centered. Used for the window chips so
-/// a third chip wraps instead of truncating the reset times.
+/// Wrapping row layout for window chips.
 private struct ChipFlow: Layout {
     var spacing: CGFloat = 7
     var rowSpacing: CGFloat = 5
@@ -1365,11 +1064,7 @@ private func shortReset(_ label: String?, _ resetAt: String?, now: Date = Date()
     return f.string(from: date)
 }
 
-/// The lane rows' reset wording, written to be read at a glance and heard
-/// aloud: "in 2h 10m" when close, "today 9:11 PM", "tomorrow 4 PM", else the
-/// weekday and date ("Sun Oct 4, 9:11 PM"). Always carries the date once the
-/// reset is past tomorrow, because "Sun 9 PM" alone made people do math.
-/// Falls back to the raw upstream label when unparseable.
+/// Lane row reset wording ("in 2h 10m", "today 9:11 PM", "Sun Oct 4, 9:11 PM").
 func laneResetText(_ label: String?, _ resetAt: String?, now: Date = Date()) -> String? {
     guard let date = UsageInsights.resetDate(resetAt: resetAt, resetLabel: label, now: now) else { return label }
     let remaining = date.timeIntervalSince(now)
@@ -1515,36 +1210,10 @@ private func emptyEstimate(used: Double, elapsed: Double, duration: TimeInterval
     return "runs out ~\(f.string(from: empty)) at this pace"
 }
 
-// MARK: - Daily budget + lanes (simplified overview)
+// MARK: - Daily budget + lanes
 
-/// The most-pressing window of a lane (the lower-headroom of 5-hour / weekly).
-private func pressWindow(_ snap: UsageSnapshot) -> (headroom: Double, label: String, reset: String?)? {
-    var worst: (used: Double, label: String, reset: String?)?
-    if let s = snap.currentSession, let u = s.usedPct {
-        worst = (u, "5-hour", s.resetLabel)
-    }
-    if let w = snap.week, let u = w.usedPct, worst == nil || u > worst!.used {
-        worst = (u, snap.provider.lowercased() == "gemini" ? "quota" : "weekly", w.resetLabel)
-    }
-    guard let worst else { return nil }
-    return (max(0, 100 - worst.used), worst.label, worst.reset)
-}
+private struct TodayRoom { let value: String; let sub: String; let color: Color; var perDay: String? = nil }
 
-private struct TodayRoom {
-    let value: String
-    let sub: String
-    let color: Color
-    var perDay: String? = nil
-
-    /// The lane row's short form: "7% a day to last". Within a day of the
-    /// reset the whole remainder is today's, and the row's percent says it.
-    var rowNote: String? { perDay.map { "\($0) a day to last" } }
-}
-
-/// "How much can I spend today?" There is no hard daily cap on the weekly-limited
-/// providers, so today's room = the weekly headroom you can spend now and still
-/// pace evenly to reset. Within a day of reset, today simply holds the full
-/// remaining headroom. Mirrors the original SpendBudgetGrid "Day room" logic.
 private func todayRoom(_ snap: UsageSnapshot, now: Date = Date()) -> TodayRoom? {
     guard let room = UsageInsights.dailyRoom(for: snap, now: now) else { return nil }
     guard let spendable = room.spendablePct else {
@@ -1876,15 +1545,21 @@ private struct ProviderDetailCard: View {
         if let health = providerHealthMessage {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
                 RowKey("Status")
-                Text(health.summary)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(health.color)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: true)
+                Button(action: { state.toggleRecovery(for: snapshot.provider) }) {
+                    Text(health.summary)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(health.color)
+                        .underline(true, color: health.color.opacity(0.75))
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
                 Spacer(minLength: 0)
             }
-            .help(health.detail)
+            .help(health.detail + " Click for recovery steps.")
         }
     }
 
@@ -1921,7 +1596,7 @@ private struct ProviderDetailCard: View {
                 message = "The official usage check failed (code \(exitCode))"
             } else if let signal = health.signal, !signal.isEmpty {
                 message = "The official usage check was stopped before it finished"
-            } else if ["unauthorized", "no_credential", "token_expired"].contains(status) {
+            } else if ["unauthorized", "no_credential", "token_expired", "keychain_locked"].contains(status) {
                 message = health.message ?? "Sign-in expired. Open the app once to sign in again"
             } else {
                 let plain = status.replacingOccurrences(of: "_", with: " ")
@@ -2151,6 +1826,8 @@ private struct CreditPoolCard: View {
 
 private struct FooterBar: View {
     @ObservedObject var state: UsageState
+    @State private var copiedDiagnostics = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 12) {
@@ -2158,10 +1835,8 @@ private struct FooterBar: View {
                     NotificationCenter.default.post(name: .usageHUDOpenActivity, object: nil)
                 }) {
                     HStack(spacing: 5) {
-                        Image(systemName: "waveform.path.ecg")
-                            .foregroundStyle(HUD.ink2)
-                        Text("Activity")
-                            .foregroundStyle(HUD.ink2)
+                        Image(systemName: "waveform.path.ecg").foregroundStyle(HUD.ink2)
+                        Text("Activity").foregroundStyle(HUD.ink2)
                     }
                     .font(.system(size: 11, weight: .semibold))
                     .contentShape(Rectangle())
@@ -2177,71 +1852,73 @@ private struct FooterBar: View {
                     .font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.slow)
                 }
                 Spacer(minLength: 4)
-                Button(action: {
-                    NotificationCenter.default.post(name: .usageHUDOpenSettings, object: nil,
-                                                    userInfo: ["pane": SettingsPane.help.rawValue])
-                }) {
+                Button(action: copyQuick) {
+                    Label(copiedDiagnostics ? "Copied" : "Copy diagnostics", systemImage: copiedDiagnostics ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(copiedDiagnostics ? HUD.go : HUD.ink2)
+                        .padding(.vertical, 4).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("usage.copyDiagnostics")
+                .help("Copy redaction-safe diagnostics to the clipboard (no tokens, file paths, accounts or usage numbers)")
+                Button(action: { NotificationCenter.default.post(name: .usageHUDOpenSettings, object: nil, userInfo: ["pane": SettingsPane.help.rawValue]) }) {
                     Label("Help", systemImage: "questionmark.circle")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(HUD.ink2)
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(HUD.ink2)
+                        .padding(.vertical, 4).contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("usage.help")
+                .buttonStyle(.plain).accessibilityIdentifier("usage.help")
                 .help("Health check, updates and contacting support")
-                Button(action: {
-                    NotificationCenter.default.post(name: .usageHUDOpenSettings, object: nil)
-                }) {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundStyle(HUD.ink2)
-                        .contentShape(Rectangle())
+                Button(action: { NotificationCenter.default.post(name: .usageHUDOpenSettings, object: nil) }) {
+                    Image(systemName: "gearshape").font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(HUD.ink2).contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Settings")
+                .buttonStyle(.plain).accessibilityLabel("Settings")
                 .help("Settings: lanes, reset pings and background refresh")
                 Button(action: { state.forceBudgetRefresh() }) {
                     HStack(spacing: 4) {
-                        if state.isManualRefreshing {
-                            ProgressView().controlSize(.mini)
-                                .frame(width: 12, height: 12)
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                        }
+                        if state.isManualRefreshing { ProgressView().controlSize(.mini).frame(width: 12, height: 12) }
+                        else { Image(systemName: "arrow.clockwise") }
                         Text("Refresh")
                     }
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(HUD.ink)
+                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(HUD.ink)
                     .padding(.horizontal, 9).padding(.vertical, 4)
                     .background(Capsule().fill(Color.white.opacity(0.08)))
-                    .overlay(Capsule().strokeBorder(HUD.hair, lineWidth: 0.5))
-                    .contentShape(Capsule())
+                    .overlay(Capsule().strokeBorder(HUD.hair, lineWidth: 0.5)).contentShape(Capsule())
                 }
-                .buttonStyle(.plain)
-                .disabled(state.isManualRefreshing || state.setupBusy)
+                .buttonStyle(.plain).disabled(state.isManualRefreshing || state.setupBusy)
                 .accessibilityIdentifier("usage.refresh")
                 .accessibilityLabel(state.isManualRefreshing ? "Refreshing usage" : "Refresh usage")
                 .help("Check every lane for a new reading now. Some providers only allow a check every few minutes.")
             }
             if let feedback = state.manualRefreshFeedback, feedback.needsAttention, !state.isManualRefreshing {
-                HStack(alignment: .top, spacing: 5) {
-                    Image(systemName: "exclamationmark.circle")
-                    Text(feedback.title)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
+                Button(action: openFirstAttentionRecovery) {
+                    HStack(alignment: .top, spacing: 5) {
+                        Image(systemName: "exclamationmark.circle")
+                        Text(feedback.title).underline(true, color: HUD.slow.opacity(0.75))
+                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.slow).contentShape(Rectangle())
                 }
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(HUD.slow)
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("usage.refresh.status")
-                .accessibilityHint(feedback.detail)
-                .help(feedback.detail)
+                .buttonStyle(.plain).accessibilityElement(children: .combine)
+                .accessibilityIdentifier("usage.refresh.status").accessibilityHint(feedback.detail)
+                .help(feedback.detail + " Click for recovery steps.")
             } else {
                 statusLine
             }
         }
+    }
+
+    private func copyQuick() {
+        SupportReport.copyQuickDiagnostics(snapshots: state.snapshots)
+        copiedDiagnostics = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copiedDiagnostics = false }
+    }
+
+    private func openFirstAttentionRecovery() {
+        if let first = UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets).first(where: { p in
+            guard let snap = UsageInsights.snapshot(for: p, in: state.snapshots) else { return true }
+            return UsageInsights.laneFreshness(for: snap).needsAttention
+        }) { state.toggleRecovery(for: first) }
     }
 
     /// One quiet line beside the buttons: what the last check found and when.
@@ -2272,61 +1949,57 @@ private struct FooterBar: View {
 
 // MARK: - Value (API value vs what you pay)
 
-/// Under the lanes: this week's usage at pay-per-use API prices beside
-/// what the plans cost. API value is always labeled as not billed; with no
-/// plan set it shows on its own, with a quiet way to set one.
-private struct SpendValueLine: View {
+/// The weekly win: this week's work at pay-per-use API prices beside what
+/// the plans cost, with the multiple as a stamp at 2× or better. Local
+/// models' token count rides under it.
+private struct WeeklyWin: View {
     @ObservedObject var state: UsageState
 
     var body: some View {
         let visible = UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets)
-        if let line = SpendDisplay.valueLine(state.spend, visibleProviders: visible) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
-                    Text(line.label)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(HUD.ink2)
-                        .lineLimit(1)
-                        .padding(.leading, LaneGrid.nameText)
-                        .frame(width: LaneGrid.name, alignment: .leading)
-                    if let value = line.value {
-                        (Text(value).font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundStyle(HUD.ink)
-                         + Text(" API value · \(SpendDisplay.notBilled)").font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.ink3))
-                            .monospacedDigit()
-                            .lineLimit(1)
-                    } else {
-                        Text("Reading session logs…")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(HUD.ink3)
-                    }
-                    Spacer(minLength: 0)
-                }
-                if line.value != nil, line.paid != nil || line.showSetPlan {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        if let paid = line.paid {
-                            (Text(paid).foregroundStyle(HUD.ink2)
-                             + Text(line.multiple.map { " · \($0)" } ?? "").foregroundStyle(HUD.ink).fontWeight(.semibold))
-                                .font(.system(size: 10.5, weight: .medium, design: .rounded))
+        let line = SpendDisplay.valueLine(state.spend, visibleProviders: visible).flatMap { $0.isWin ? $0 : nil }
+        let local = visible.contains("local") ? UsageInsights.snapshot(for: "local", in: state.snapshots)?.session : nil
+        if line != nil || local != nil {
+            VStack(alignment: .leading, spacing: 4) {
+                if let line {
+                    HStack(alignment: .center, spacing: 6) {
+                        if let value = line.value {
+                            (Text(value).font(.system(size: 22, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
+                             + Text(line.paidWeek.map { "  of work for \($0) this week" } ?? "  of work this week")
+                                .font(.system(size: 12.5, weight: .medium)).foregroundStyle(HUD.ink2))
                                 .monospacedDigit()
                                 .lineLimit(1)
-                        }
-                        if line.showSetPlan {
-                            if line.paid != nil { Text("·").font(.system(size: 10.5)).foregroundStyle(HUD.ink3) }
-                            SetPlanLink()
+                                .minimumScaleFactor(0.8)
+                        } else {
+                            Text("Reading session logs…").font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.ink3)
                         }
                         Spacer(minLength: 0)
+                        if let m = line.multiple, (line.multipleValue ?? 0) >= 2 {
+                            Text(m)
+                                .font(.system(size: 15, weight: .heavy, design: .rounded))
+                                .foregroundStyle(HUD.go)
+                                .padding(.horizontal, 8).padding(.vertical, 2)
+                                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(HUD.go, lineWidth: 1.5))
+                                .rotationEffect(.degrees(-4))
+                        } else if line.showSetPlan {
+                            SetPlanLink()
+                        }
                     }
-                    .padding(.leading, LaneGrid.subLead)
+                    .help(line.help)
+                }
+                if let local {
+                    Text("Local: \(compactTokenCount(local.todayTotal ?? 0)) tokens today, \(compactTokenCount(local.weekTotal ?? 0)) this week")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(HUD.ink3)
+                        .help("Tokens your local models (Ollama) read and wrote, counted from Ollama's logs on this Mac. Local models have no usage limit.")
                 }
             }
             .padding(.top, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .overlay(alignment: .top) { Rectangle().fill(HUD.hairSoft).frame(height: 0.5) }
-            .help(line.help)
         }
     }
 }
-
 /// "Set your plan": opens Settings on the Plans tab.
 private struct SetPlanLink: View {
     var body: some View {
@@ -2360,31 +2033,6 @@ private struct SectionCaption: View {
 /// The fixed-gutter eyebrow label on a detail-card row (WINDOWS / SOURCE / SPEND…).
 /// Lighter weight + wider tracking than the old heavy keys, so a stack of rows
 /// reads as a refined spec list instead of a debug-log column.
-/// Where a lane's number came from, as quiet text under its percentage.
-/// The panel's claim is that every number carries its provenance without
-/// expanding anything, but six glowing pills drowned the numbers, so this is
-/// muted text: a small seal for official readings, amber only when a
-/// reading stopped refreshing ("old") and describes the past.
-private struct TrustTag: View {
-    let trust: UsageInsights.LaneTrust
-
-    var body: some View {
-        HStack(spacing: 3) {
-            if trust.level == "official", trust.isLive {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.system(size: 8.5))
-                    .foregroundStyle(HUD.go.opacity(0.8))
-            }
-            Text(trust.tagText)
-        }
-        .font(.system(size: 9.5, weight: .medium))
-        .foregroundStyle(!trust.isGap && !trust.isLive ? HUD.watch.opacity(0.9) : HUD.ink3)
-        .lineLimit(1)
-        .fixedSize()
-        .help(trust.help)
-    }
-}
-
 private struct RowKey: View {
     let text: String
     init(_ text: String) { self.text = text }
@@ -2394,20 +2042,6 @@ private struct RowKey: View {
             .foregroundStyle(HUD.ink3)
             .lineLimit(1)
             .frame(width: 64, alignment: .leading)
-    }
-}
-
-private struct PillButton: View {
-    let title: String; let system: String; let tint: Color; let action: () -> Void
-    var body: some View {
-        Button(action: action) {
-            Label(title, systemImage: system)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(HUD.ink)
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(tint)
-                .clipShape(Capsule())
-        }.buttonStyle(.plain)
     }
 }
 
@@ -2421,16 +2055,11 @@ private struct BreathingDot: View {
     }
 }
 
-/// The app's own icon in the header. A bundled app shows its real icon
-/// (three glass lane bars with the pace tick on graphite); `swift run` and
-/// snapshot renders have no bundle icon, so they draw the same mark.
+/// App icon in the header (bundled .app icon, else drawn vector mark).
 private struct AppMark: View {
     var body: some View {
         GeometryReader { geo in
             if let icon = Self.bundleIcon {
-                // The system icon carries the standard margin around its
-                // tile; scale it so the tile itself fills the frame, as the
-                // drawn mark does.
                 Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)
@@ -2443,8 +2072,6 @@ private struct AppMark: View {
         .accessibilityHidden(true)
     }
 
-    /// Only a real .app with an icon declared in its Info.plist; otherwise
-    /// AppKit hands back the generic app icon.
     static let bundleIcon: NSImage? = {
         guard Bundle.main.bundleURL.pathExtension == "app" else { return nil }
         let info = Bundle.main.infoDictionary ?? [:]
@@ -2632,22 +2259,73 @@ private struct LaneSetupRow: View {
     }
 }
 
+private struct LaneRecoveryCard: View {
+    let recovery: LaneRecovery
+    @ObservedObject var state: UsageState
+    @State private var copiedCmd = false
+    @State private var copiedDiag = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(recovery.title, systemImage: "wrench.and.screwdriver.fill")
+                    .font(.system(size: 12.5, weight: .semibold)).foregroundStyle(HUD.watch)
+                Spacer(minLength: 8)
+                Button(action: { state.activeRecoveryProvider = nil }) {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(HUD.ink3).frame(width: 18, height: 18).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).accessibilityLabel("Close recovery steps")
+            }
+            Text(recovery.why).font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(recovery.step).font(.system(size: 11.5, weight: .semibold)).foregroundStyle(HUD.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                if let cmd = recovery.command {
+                    Button(copiedCmd ? "Copied `\(cmd)`" : "Copy `\(cmd)`") {
+                        LaneRecovery.copyCommand(cmd); copiedCmd = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copiedCmd = false }
+                    }.controlSize(.small)
+                    Button("Open Terminal") { LaneRecovery.openTerminal() }.controlSize(.small)
+                }
+                Button(state.isManualRefreshing ? "Checking…" : "Check again") { state.forceBudgetRefresh() }
+                    .controlSize(.small).disabled(state.isManualRefreshing || state.setupBusy)
+                Spacer(minLength: 0)
+                Button(copiedDiag ? "Copied" : "Copy diagnostics") {
+                    SupportReport.copyQuickDiagnostics(snapshots: state.snapshots); copiedDiag = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copiedDiag = false }
+                }
+                .controlSize(.small).buttonStyle(.plain)
+                .foregroundStyle(copiedDiag ? HUD.go : HUD.ink2).underline(!copiedDiag, color: HUD.ink3)
+            }
+            .font(.system(size: 11, weight: .semibold))
+        }
+        .padding(12).background(HUD.cardFill)
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(HUD.watch.opacity(0.35), lineWidth: 0.75))
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .accessibilityElement(children: .contain).accessibilityIdentifier("usage.recoveryCard")
+    }
+}
+
 private struct EmptyLaneRow: View {
     let provider: String
+    var onRecover: () -> Void = {}
     var body: some View {
-        // Same grid as the live lanes: the name holds its column and the
-        // one thing to do sits where the bar would be.
-        HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
-            LaneName(title: laneTitle(provider), dot: HUD.provider(provider).opacity(0.35))
-                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
-            Text(line)
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(HUD.ink3)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
+        Button(action: onRecover) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(UsageInsights.label(for: provider))
+                    .font(.system(size: 13.5, weight: .semibold)).foregroundStyle(HUD.ink2)
+                    .frame(width: 62, alignment: .leading)
+                Text(line).font(.system(size: 10.5, weight: .medium)).foregroundStyle(HUD.watch)
+                    .underline(true, color: HUD.watch.opacity(0.7)).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 8).contentShape(Rectangle())
         }
-        .accessibilityElement(children: .ignore)
+        .buttonStyle(.plain).accessibilityElement(children: .ignore)
         .accessibilityLabel("\(UsageInsights.label(for: provider)), no reading yet. \(line)")
+        .accessibilityAddTraits(.isButton)
     }
 
     private var line: String { EmptyLaneCopy.line(for: provider) }
@@ -2664,8 +2342,6 @@ private struct EmptyUsageView: View {
     }
 }
 
-// MARK: - Verdict / binding-constraint model
-
 private struct ModeStyle {
     let raw: String
     init(_ mode: String) { self.raw = mode.lowercased() }
@@ -2681,85 +2357,6 @@ private struct ModeStyle {
         default: return HUD.wait
         }
     }
-    var onColor: Color { raw == "yellow" ? .black : Color(hex: 0x06231A) }
-    var icon: String {
-        switch raw {
-        case "green": return "bolt.fill"
-        case "yellow": return "eye.fill"
-        case "orange": return "exclamationmark.triangle.fill"
-        case "red": return "hand.raised.fill"
-        case "freeze": return "snowflake"
-        case "check": return "questionmark.circle.fill"
-        default: return "clock.fill"
-        }
-    }
-    var word: String {
-        switch raw {
-        case "green": return "GO"
-        case "yellow": return "WATCH"
-        case "orange": return "SLOW"
-        case "red": return "STOP"
-        case "freeze": return "FREEZE"
-        case "check": return "CHECK"
-        default: return "WAIT"
-        }
-    }
-    /// What VoiceOver says for the pill word.
-    var spokenWord: String {
-        switch raw {
-        case "green": return "Go"
-        case "yellow": return "Watch"
-        case "orange": return "Slow down"
-        case "red": return "Stop"
-        case "freeze": return "Out until reset"
-        case "check": return "Check"
-        default: return "Waiting"
-        }
-    }
-
-    var reassure: String {
-        switch raw {
-        case "green": return "This lane has room. The other lanes below have their own numbers."
-        case "yellow": return "You're using this lane faster than its limit lasts. Keep sessions short."
-        case "orange": return "Save this lane for work that matters most."
-        case "red": return "Nearly out. Save what's left for work that can't wait."
-        case "freeze": return "Out until the reset. Use another lane until then."
-        case "check": return "This lane's reading isn't current. Refresh before trusting the verdict."
-        default: return "Waiting for a reading after the reset."
-        }
-    }
-}
-
-private struct Binding {
-    let provider: String
-    let headroom: Double
-    let title: String       // "Claude 5-hour"
-    let resetLabel: String?
-}
-
-private func bindingConstraint(_ snapshots: [UsageSnapshot]) -> Binding? {
-    var worst: (provider: String, used: Double, title: String, reset: String?)?
-    for snap in snapshots {
-        let name = UsageInsights.label(for: snap.provider)
-        let pid = snap.provider.lowercased()
-        if let s = snap.currentSession, let used = s.usedPct {
-            if worst == nil || used > worst!.used {
-                worst = (pid, used, "\(name) \(shortWindowTitle(snap, isSession: true))", s.resetLabel)
-            }
-        }
-        if let w = snap.week, let used = w.usedPct {
-            if worst == nil || used > worst!.used {
-                worst = (pid, used, "\(name) \(shortWindowTitle(snap, isSession: false))", w.resetLabel)
-            }
-        }
-    }
-    guard let worst else { return nil }
-    return Binding(provider: worst.provider, headroom: max(0, 100 - worst.used), title: worst.title, resetLabel: worst.reset)
-}
-
-private func shortWindowTitle(_ snapshot: UsageSnapshot, isSession: Bool) -> String {
-    if isSession { return "5-hour" }
-    return snapshot.provider.lowercased() == "gemini" ? "Quota" : "Weekly"
 }
 
 /// Lead with Claude (the usual headline lane), then Codex, Gemini, Grok, Local.
@@ -2787,7 +2384,6 @@ enum SnapshotMode {
 // MARK: - Design tokens (map 1:1 to the design-lab prototype)
 
 private enum HUD {
-    static let xxs: CGFloat = 2
     static let xs: CGFloat = 4
     static let sm: CGFloat = 8
     static let md: CGFloat = 12
@@ -2801,8 +2397,6 @@ private enum HUD {
     static let hairSoft = Color.white.opacity(0.06)
     static let track = Color.white.opacity(0.08)
 
-    // Card material: a faint top-lit gradient + a slightly brighter hairline so
-    // surfaces read as raised glass instead of flat 3%-white rectangles.
     static let cardStroke = Color.white.opacity(0.11)
     static var cardFill: LinearGradient {
         LinearGradient(colors: [Color.white.opacity(0.06), Color.white.opacity(0.02)],
@@ -2817,10 +2411,8 @@ private enum HUD {
     static let wait = Color(hex: 0x8A8F98)
 
     static let claude = Color(hex: 0xE07A5B)
-    static let fable = Color(hex: 0xF06A6A)
     static let codex = Color(hex: 0x5FD3C4)
     static let gemini = Color(hex: 0x6F8BF5)
-    static let gemini2 = Color(hex: 0xA472EF)
     static let grok = Color(hex: 0xD7DBE2)
     static let local = Color(hex: 0x4AC5D9)
 
@@ -2835,44 +2427,12 @@ private enum HUD {
         }
     }
 
-    static func usedColor(_ used: Double) -> Color {
-        let v = used.isFinite ? used : 0
-        if v >= 90 { return stop }
-        if v >= 75 { return slow }
-        if v >= 55 { return watch }
-        return go
-    }
-
-    /// Color for a "remaining/headroom" value (higher = healthier).
     static func remainColor(_ remaining: Double) -> Color {
         let v = remaining.isFinite ? remaining : 0
         if v <= 10 { return stop }
         if v <= 25 { return slow }
         if v <= 45 { return watch }
         return go
-    }
-
-    static func freshness(_ f: SourceFreshness) -> Color {
-        switch f.state {
-        case "live", "fresh": return go
-        case "aging", "unknown": return watch
-        case "stale": return slow
-        case "missing": return stop
-        default: return ink3
-        }
-    }
-
-    /// Colour for a confidence level. Reuses the semantic ramp rather than
-    /// introducing a second vocabulary: provenance you can lean on reads green,
-    /// a derived number reads amber, an undeclared one reads grey.
-    static func trust(_ level: String) -> Color {
-        switch level {
-        case "official": return go
-        case "high": return local
-        case "medium": return watch
-        case "manual": return slow
-        default: return wait
-        }
     }
 }
 
@@ -2923,10 +2483,4 @@ func noWidow(_ text: String) -> String {
     let tail = words.suffix(3).joined(separator: "\u{00A0}")
     words.removeLast(3)
     return (words + [tail]).joined(separator: " ")
-}
-
-private func timeOnly(_ d: Date) -> String {
-    let f = DateFormatter()
-    f.dateFormat = "h:mm a"
-    return f.string(from: d)
 }

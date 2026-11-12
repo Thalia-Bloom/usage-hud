@@ -377,7 +377,7 @@ function checkClaudeOfficialUsage() {
   // The remedy for unauthorized/no_credential lives in the writer's own
   // message field (e.g. "open Claude Code once to refresh the token"); the
   // doctor surfaces it rather than inventing separate advice.
-  const FAIL_STATUSES = ['unauthorized', 'no_credential', 'token_expired', 'failed', 'error', 'broken'];
+  const FAIL_STATUSES = ['unauthorized', 'no_credential', 'token_expired', 'keychain_locked', 'failed', 'error', 'broken'];
   const WARN_STATUSES = ['rate_limited', 'offline', 'unparsed', 'aborted', 'unsettled'];
 
   if (FAIL_STATUSES.includes(status)) {

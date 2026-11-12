@@ -1054,6 +1054,58 @@ def test_api_mode_skips_while_shared_cooldown_is_active() -> None:
         assert not (state / "claude-official-status.json").exists()
 
 
+def test_credential_falls_back_to_service_only_and_credentials_file_and_detects_lock() -> None:
+    module = load_module()
+    with tempfile.TemporaryDirectory(prefix="usage-claude-cred-fallback-") as raw_dir:
+        state = Path(raw_dir)
+        configure_module(module, state)
+        (state / ".claude").mkdir()
+        module.HOME = state
+        seen_cmds: list[list[str]] = []
+
+        def service_only_ok(cmd, **_kw):
+            seen_cmds.append(list(cmd))
+            if "-a" in cmd:
+                return subprocess.CompletedProcess(cmd, returncode=44, stdout="", stderr="not found")
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=json.dumps({"claudeAiOauth": {"accessToken": "svc-token"}}), stderr="")
+
+        orig_run, orig_tok = module.subprocess.run, os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        try:
+            module.subprocess.run = service_only_ok
+            module.LAST_CREDENTIAL.clear()
+            assert module.resolve_credential() == "svc-token" and module.LAST_CREDENTIAL.get("lookup") == "keychain"
+            assert any("-a" not in c for c in seen_cmds)
+            stamp = module.credential_stamp("svc-token")
+            assert stamp is not None and "svc-token" not in stamp and len(stamp) == 16
+            module.subprocess.run = lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode=36, stdout="", stderr="User interaction is not allowed.")
+            module.LAST_CREDENTIAL.clear()
+            assert module.run_api_mode() == 1 and json.loads(module.OFFICIAL_STATUS_PATH.read_text())["status"] == "keychain_locked"
+            (state / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "file-token"}}))
+            module.LAST_CREDENTIAL.clear()
+            assert module.resolve_credential() == "file-token" and module.LAST_CREDENTIAL.get("lookup") == "credentials_file"
+        finally:
+            module.subprocess.run = orig_run
+            if orig_tok is not None:
+                os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = orig_tok
+
+
+def test_manual_refresh_bypasses_failure_cooldown_but_keeps_429_cooldown() -> None:
+    with tempfile.TemporaryDirectory(prefix="usage-claude-manual-refresh-") as raw_dir:
+        root = Path(raw_dir)
+        state = root / "state"
+        state.mkdir(parents=True)
+        (state / ".claude-official-rate-limited-until").write_text(str(int(time.time()) + 500))
+        write_json(state / "claude-official-status.json", {"status": "no_credential", "updatedAt": "2026-01-01T00:00:00Z"})
+        env = clean_env(root, state, {"CLAUDE_CODE_OAUTH_TOKEN": "test-token", "BLOOM_CLAUDE_USAGE_API_FIXTURE": str(FIXTURE_PATH), "CODEX_USAGE_HUD_MANUAL_REFRESH": "1"})
+        ok = run_fetch(["--mode", "api"], env)
+        assert ok.returncode == 0, ok.stdout + ok.stderr
+        assert json.loads((state / "claude-official-status.json").read_text())["status"] == "ok"
+        (state / ".claude-official-rate-limited-until").write_text(str(int(time.time()) + 300))
+        write_json(state / "claude-official-status.json", {"status": "rate_limited", "updatedAt": "2026-01-01T00:00:00Z"})
+        held = run_fetch(["--mode", "api"], env)
+        assert held.returncode == 0 and "cooldown" in held.stdout
+
+
 TESTS = [
     test_api_mode_parses_fixture_into_expected_shape,
     test_api_mode_other_weekly_scoped_names_become_skills,
@@ -1084,6 +1136,8 @@ TESTS = [
     test_tls_context_falls_back_to_system_bundle_when_store_is_empty,
     test_api_mode_skips_when_official_reading_is_fresh_unless_forced,
     test_api_mode_skips_while_shared_cooldown_is_active,
+    test_credential_falls_back_to_service_only_and_credentials_file_and_detects_lock,
+    test_manual_refresh_bypasses_failure_cooldown_but_keeps_429_cooldown,
 ]
 
 

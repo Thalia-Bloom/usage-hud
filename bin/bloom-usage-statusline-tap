@@ -77,15 +77,7 @@ function tap(raw) {
   let existing = {};
   try { existing = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8')); } catch (_) {}
 
-  // Claude Code drops a rate-limit window from the payload the moment its
-  // resets_at passes. When the payload no longer carries a window the last
-  // snapshot had, the gap needs an official refetch -- but only when the
-  // cached window is actually unusable going forward. A session whose
-  // payload never carries rate_limits at all (API-key auth, or renders
-  // before the first response) must not keep spawning a refetch every 120s
-  // for its whole life just because this one payload is silent: when the
-  // cached window's resetAt is still ahead of now, that value stays true
-  // and the keepalive's 10-minute refresh already keeps it fresh.
+  // Refetch only when a previously cached window dropped AND is no longer valid.
   const now = new Date();
   const droppedFiveHour = !(rl && rl.five_hour) && windowNeedsRefetch(existing.currentSession, now);
   const droppedSevenDay = !(rl && rl.seven_day) && windowNeedsRefetch(existing.week, now);
@@ -250,19 +242,7 @@ function writeAtomicJSON(target, payload) {
 
 function round1(n) { return Math.round(Number(n) * 10) / 10; }
 
-// Usage is monotonic within one window, but the reading on disk can also be
-// wrong in either direction: an idle Claude Code session repaints the
-// rate_limits payload from its last response, which is LOWER than the live
-// number when the session has merely been idle, and HIGHER than the live
-// number right after an account reset that kept resets_at (the sticky 99%
-// weekly bar on 2026-10-04). Within one window (resetAt equal to the minute):
-//   - a lower candidate never regresses the number on disk;
-//   - a fresh official reading (< OFFICIAL_AUTHORITY_MS old) also holds
-//     against a jump of DISAGREEMENT_REFETCH_PTS or more;
-//   - any other candidate wins.
-// A disagreement of DISAGREEMENT_REFETCH_PTS or more, whichever side won,
-// is reported as disputed so the caller can ask the official endpoint.
-// A different or later resetAt is a new window: the candidate wins outright.
+// Monotonic within one window unless a fresh official reading disputes a jump.
 function mergeMonotonicWindow(existingWindow, candidate, now) {
   const tagged = { ...candidate, source: 'statusline' };
   if (!existingWindow || typeof existingWindow !== 'object') return { window: tagged, disputed: false };
@@ -432,44 +412,10 @@ function parseMonthDayTime(label, year, now) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function newestISO(...values) {
-  const dates = values.map(parseDate).filter(Boolean);
-  if (!dates.length) return undefined;
-  return new Date(Math.max(...dates.map(date => date.getTime()))).toISOString();
-}
-
-function parseTrackerDate(value) {
-  if (!value) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
 function parseDate(v) {
   if (!v) return null;
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function formatMoney(value) {
-  return Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 });
-}
-
-function formatCompact(value) {
-  return Number(value).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 });
-}
-
-function intOrUndefined(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? Math.trunc(number) : undefined;
-}
-
-function numberOrUndefined(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : undefined;
-}
-
-function pruneUndefined(value) {
-  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
 }
 
 function formatResetLabel(raw, timeOnly) {

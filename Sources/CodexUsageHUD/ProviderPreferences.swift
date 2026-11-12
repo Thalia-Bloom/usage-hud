@@ -21,7 +21,6 @@ enum ProviderCatalog {
     static var displayProviders: [ProviderDefinition] { all }
 
     static var ids: [String] { all.map(\.id) }
-    static var displayIds: [String] { displayProviders.map(\.id) }
 
     static func definition(for id: String) -> ProviderDefinition? {
         all.first { $0.id == id.lowercased() }

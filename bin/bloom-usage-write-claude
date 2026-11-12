@@ -45,7 +45,7 @@ const TAP_EVENT_FRESH_MS = 15 * 60 * 1000;
 // Durable failures that need a human (open Claude Code once / re-auth), not a
 // transient blip. A fresh tap event never bypasses degraded health for these:
 // the account-level problem is still true no matter how recently the tap fired.
-const DURABLE_OFFICIAL_STATUSES = new Set(['unauthorized', 'no_credential', 'token_expired']);
+const DURABLE_OFFICIAL_STATUSES = new Set(['unauthorized', 'no_credential', 'token_expired', 'keychain_locked']);
 
 main();
 
@@ -80,7 +80,7 @@ function main() {
   // it used to) that early return would silently suppress the 10-minute Fable
   // refetch for as long as the session stayed active. The cooldown file and
   // the 120s attempt stamp are the only throttles on this call.
-  maybeRefetchOfficial(getOfficialCapturedAt(snapshot), now);
+  maybeRefetchOfficial(getOfficialCapturedAt(snapshot), now, snapshot);
 
   if (shouldSkipDueToTapGrace(snapshot, now)) return;
 
@@ -174,31 +174,33 @@ function getOfficialCapturedAt(snapshot) {
   return null;
 }
 
-function maybeRefetchOfficial(officialCapturedAt, now) {
+function maybeRefetchOfficial(officialCapturedAt, now, snapshot = null) {
   try {
     const capturedDate = parseDate(officialCapturedAt);
     const ageSeconds = capturedDate ? (now.getTime() - capturedDate.getTime()) / 1000 : Infinity;
     if (ageSeconds <= OFFICIAL_MAX_AGE_SECONDS) return;
-    if (isOfficialCooldownActive(now)) return;
-    if (officialAttemptStampAgeMs(now) <= OFFICIAL_ATTEMPT_COOLDOWN_MS) return;
+    let statusObj = null;
+    try { statusObj = JSON.parse(fs.readFileSync(OFFICIAL_STATUS_PATH, 'utf8')); } catch (_) {}
+    const prevStatus = String((statusObj && statusObj.status) || '').toLowerCase();
+    const statusAt = parseDate(statusObj && statusObj.updatedAt);
+    const tapAt = parseDate(snapshot && snapshot.eventAt);
+    const tapRenewedAfterAuthFail = Boolean(
+      tapAt && statusAt && tapAt > statusAt && (now.getTime() - tapAt.getTime()) < TAP_EVENT_FRESH_MS
+      && ['unauthorized', 'no_credential', 'token_expired'].includes(prevStatus)
+    );
+    if (!tapRenewedAfterAuthFail && isOfficialCooldownActive(now)) return;
+    if (!tapRenewedAfterAuthFail && officialAttemptStampAgeMs(now) <= OFFICIAL_ATTEMPT_COOLDOWN_MS) return;
 
     try {
       fs.mkdirSync(path.dirname(OFFICIAL_ATTEMPT_STAMP_PATH), { recursive: true, mode: 0o700 });
-      // Content is unix epoch seconds, matching the Stop hook's `date +%s`
-      // and the tap's own write. Every reader, this writer included,
-      // throttles on the file's mtime, never on parsing this content, so
-      // the three writers of this stamp never disagree.
       fs.writeFileSync(OFFICIAL_ATTEMPT_STAMP_PATH, String(Math.floor(now.getTime() / 1000)), { mode: 0o600 });
-    } catch (_) {
-      // Best-effort bookkeeping; a failed stamp write still lets the spawn below run.
-    }
+    } catch (_) {}
 
-    const child = spawn(OFFICIAL_FETCH_BIN, ['--mode', 'api'], { stdio: 'ignore', detached: true });
+    const env = tapRenewedAfterAuthFail ? { ...process.env, CODEX_USAGE_HUD_MANUAL_REFRESH: '1' } : process.env;
+    const child = spawn(OFFICIAL_FETCH_BIN, ['--mode', 'api'], { stdio: 'ignore', detached: true, env });
     child.on('error', () => {});
     child.unref();
-  } catch (_) {
-    // Refetching the official reading is best-effort; it must never break the keepalive write.
-  }
+  } catch (_) {}
 }
 
 function isOfficialCooldownActive(now) {
@@ -375,48 +377,10 @@ function parseMonthDayTime(label, year, now) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function newestISO(...values) {
-  const dates = values.map(parseDate).filter(Boolean);
-  if (!dates.length) return undefined;
-  return new Date(Math.max(...dates.map(date => date.getTime()))).toISOString();
-}
-
-function round1(n) {
-  return Math.round(Number(n) * 10) / 10;
-}
-
 function parseDate(v) {
   if (!v) return null;
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function parseTrackerDate(value) {
-  if (!value) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-function formatMoney(value) {
-  return Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 });
-}
-
-function formatCompact(value) {
-  return Number(value).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 });
-}
-
-function intOrUndefined(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? Math.trunc(number) : undefined;
-}
-
-function numberOrUndefined(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : undefined;
-}
-
-function pruneUndefined(value) {
-  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
 }
 
 function writeAtomic(target, payload) {

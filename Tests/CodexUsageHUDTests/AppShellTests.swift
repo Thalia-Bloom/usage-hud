@@ -194,37 +194,29 @@ final class AppShellTests: XCTestCase {
         XCTAssertEqual(readings.map(\.name), ["Claude", "Fable", "Codex", "Grok"])
         XCTAssertEqual(readings[1].weekUsed, 85)
         XCTAssertEqual(readings[1].mode, "orange")
-        XCTAssertEqual(readings[2].glyphLane.usedPct, 12, "session stands in when there is no weekly reading")
+        XCTAssertEqual(readings[2].weekUsed ?? readings[2].sessionUsed, 12, "session stands in when there is no weekly reading")
         XCTAssertFalse(readings[3].isConnected)
         XCTAssertEqual(readings[3].mode, "unknown")
     }
 
     // MARK: Glyph
 
-    func testGlyphFillSeparatesLowPercentages() {
-        let oneX = [0.0, 20, 39].map { UsageStatusIcon.fillHeight(usedPct: $0, pixelsPerPoint: 1) }
-        XCTAssertEqual(Set(oneX).count, 3, "0, 20 and 39% must not look the same at 1x: \(oneX)")
-        XCTAssertEqual(UsageStatusIcon.fillHeight(usedPct: 0, pixelsPerPoint: 2), 0.5, "a known 0% keeps a one-pixel base")
-        XCTAssertEqual(UsageStatusIcon.fillHeight(usedPct: 0, pixelsPerPoint: 1), 1)
-        XCTAssertNotEqual(UsageStatusIcon.fillHeight(usedPct: 10, pixelsPerPoint: 2), UsageStatusIcon.fillHeight(usedPct: 0, pixelsPerPoint: 2))
-        XCTAssertEqual(UsageStatusIcon.fillHeight(usedPct: 100, pixelsPerPoint: 2), UsageStatusIcon.trackHeight)
-        XCTAssertEqual(UsageStatusIcon.fillHeight(usedPct: 140, pixelsPerPoint: 2), UsageStatusIcon.trackHeight)
-        for used in stride(from: 0.0, through: 100, by: 7) {
-            let h = UsageStatusIcon.fillHeight(usedPct: used, pixelsPerPoint: 1)
-            XCTAssertEqual(h, h.rounded(), "1x fill must land on whole pixels")
-        }
+    func testGaugeFillSeparatesLowPercentages() {
+        let oneX = [0.0, 20, 39].map { UsageStatusIcon.fillWidth(left: $0, pixelsPerPoint: 1) }
+        XCTAssertEqual(Set(oneX).count, 3, "0, 20 and 39% left must not look the same at 1x: \(oneX)")
+        XCTAssertEqual(UsageStatusIcon.fillWidth(left: 0, pixelsPerPoint: 2), 0.5, "a known 0% keeps a one-pixel sliver")
+        XCTAssertEqual(UsageStatusIcon.fillWidth(left: 140, pixelsPerPoint: 2), UsageStatusIcon.gaugeWidth - 4)
+        XCTAssertEqual(UsageStatusIcon.text(left: 47), "47% left", "the menu bar number always says left")
     }
 
-    func testGlyphStaysNarrowAndTemplateWhileCalm() {
-        XCTAssertLessThanOrEqual(UsageStatusIcon.width(laneCount: 8), 40)
-        let calm = [GlyphLane(name: "Claude", usedPct: 30, mode: "green", isConnected: true),
-                    GlyphLane(name: "Grok", usedPct: nil, mode: "unknown")]
-        XCTAssertTrue(UsageStatusIcon.isTemplate(lanes: calm))
-        XCTAssertTrue(UsageStatusIcon.image(lanes: calm).isTemplate)
-        let hot = calm + [GlyphLane(name: "Codex", usedPct: 95, mode: "red", isConnected: true)]
-        XCTAssertFalse(UsageStatusIcon.isTemplate(lanes: hot))
-        // A hot mode with no reading has nothing to color.
-        XCTAssertTrue(UsageStatusIcon.isTemplate(lanes: [GlyphLane(name: "Codex", usedPct: nil, mode: "red")]))
+    func testGaugeStaysTemplateWhileCalm() {
+        XCTAssertTrue(UsageStatusIcon.image(left: 53, tone: .calm).isTemplate)
+        XCTAssertTrue(UsageStatusIcon.image(left: nil, tone: .spent).isTemplate, "no reading has nothing to color")
+        XCTAssertFalse(UsageStatusIcon.image(left: 8, tone: .spent).isTemplate)
+        let now = Date()
+        let pace = LanePace(used: 4, elapsed: 2, windowTag: "wk", status: "ON PACE", statusColor: .gray, barColor: .gray, valueColor: .gray, sub: nil)
+        XCTAssertEqual(UsageStatusIcon.tone(pace, backAt: now.addingTimeInterval(-600), now: now), .back)
+        XCTAssertEqual(UsageStatusIcon.tone(pace, backAt: now.addingTimeInterval(-7200), now: now), .calm, "green only for the first hour")
     }
 
     // MARK: Clicks, keys, motion

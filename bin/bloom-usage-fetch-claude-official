@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""
-Fetch Claude Code's official /usage panel through a private PTY and merge it
-into the Codex Usage HUD state dir.
-
-Claude's rich plan usage currently comes from the interactive /usage panel, not
-the statusline payload. This script opens Claude Code with a pseudo-terminal,
-runs /usage, parses the displayed official percentages, writes the HUD snapshot,
-then exits without sending a model prompt.
-"""
+"""Fetch Claude Code official usage (OAuth API or /usage PTY fallback) into the HUD state dir."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pty
+import pwd
 import re
 import select
 import shutil
@@ -30,7 +24,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-
 HOME = Path.home()
 STATE_DIR = Path(os.environ.get("CODEX_USAGE_HUD_STATE_DIR") or os.environ.get("BLOOM_USAGE_DIR") or HOME / ".codex-usage-hud")
 USAGE_PATH = Path(os.environ.get("BLOOM_USAGE_OUT", STATE_DIR / "claude-usage.json"))
@@ -38,47 +31,19 @@ CAPTURE_PATH = Path(os.environ.get("BLOOM_CLAUDE_USAGE_CAPTURE", STATE_DIR / "cl
 OFFICIAL_STATUS_PATH = Path(os.environ.get("BLOOM_CLAUDE_USAGE_STATUS", STATE_DIR / "claude-official-status.json"))
 RATE_LIMIT_COOLDOWN_PATH = Path(os.environ.get("BLOOM_CLAUDE_USAGE_RATE_LIMIT_COOLDOWN", STATE_DIR / ".claude-official-rate-limited-until"))
 CLAUDE_BIN = os.environ.get("BLOOM_CLAUDE_BIN") or shutil.which("claude") or str(HOME / ".local/bin/claude")
-# Claude Code v2.1.x starts slower than the old 18s budget; the loop exits
-# early once the panel parses, so a generous ceiling costs nothing on fast runs.
 TIMEOUT_SECONDS = float(os.environ.get("BLOOM_CLAUDE_USAGE_TIMEOUT", "45"))
 RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("BLOOM_CLAUDE_USAGE_RATE_LIMIT_COOLDOWN_SECONDS", "1800"))
-
-# Two consecutive parses of the PTY output must agree, at least this many
-# seconds apart, before the panel is accepted as settled (see read_until_usage).
 SETTLE_INTERVAL_SECONDS = 1.5
 
-# API mode: the same endpoint Claude Code's own /usage panel reads.
 API_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 API_TIMEOUT_SECONDS = float(os.environ.get("BLOOM_CLAUDE_USAGE_API_TIMEOUT", "10"))
 KEYCHAIN_TIMEOUT_SECONDS = float(os.environ.get("BLOOM_CLAUDE_KEYCHAIN_TIMEOUT", "5"))
-# Deliberately shorter than the PTY cooldown: the API call is cheap, so retry sooner.
 API_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("BLOOM_CLAUDE_USAGE_API_RATE_LIMIT_COOLDOWN_SECONDS", "300"))
-# A durable failure (revoked token, no Keychain entry at all, network down) is
-# not a transient rate limit: retrying every ~120s would hammer the Keychain
-# and the endpoint with a request that cannot succeed until the user signs in
-# again. These share the same cooldown file the rate-limited path uses, so
-# every caller that already throttles on it backs off automatically.
 API_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("BLOOM_CLAUDE_USAGE_FAILURE_COOLDOWN_SECONDS", "600"))
-# API mode is safe to call on a fixed short loop (the claude-writer LaunchAgent
-# runs it every 60s ahead of the keepalive) because it skips when the official
-# reading is younger than this. Same env name the keepalive writer honors, so
-# the two never disagree about what "fresh" means. --force bypasses it.
 OFFICIAL_MAX_AGE_SECONDS = int(os.environ.get("BLOOM_CLAUDE_OFFICIAL_MAX_AGE_SECONDS", "300"))
-# CA bundles to trust when the interpreter's own store is empty. A python.org
-# build that never ran "Install Certificates.command" (the /usr/local/bin
-# python3 a login shell's path_helper puts ahead of Homebrew) ships with zero
-# CAs, so every HTTPS call fails CERTIFICATE_VERIFY_FAILED and used to be
-# reported as a bare "unreachable". macOS ships /etc/ssl/cert.pem.
 SYSTEM_CA_BUNDLES = ("/etc/ssl/cert.pem",)
 
-
-# SIGTERM arrives when the caller's own timeout (bloom-usage-capture.sh, the
-# live-scrape launchd job) decides this run has taken too long. Earlier this
-# raised SystemExit from inside read_until_usage's loop, which unwound past
-# process_usage entirely and left no status written at all. Setting a flag
-# instead lets the read loop end on its own terms and process_usage run to
-# completion and record an honest "aborted" status.
 _terminate_requested = False
 
 
@@ -89,19 +54,7 @@ def request_termination(_signum: int, _frame: Any) -> None:
 
 signal.signal(signal.SIGTERM, request_termination)
 
-
-ANSI_RE = re.compile(
-    r"""
-    \x1b
-    (?:
-      \[[0-?]*[ -/]*[@-~]
-      |\][^\x07]*(?:\x07|\x1b\\)
-      |[PX^_].*?\x1b\\
-      |[@-Z\\-_]
-    )
-    """,
-    re.VERBOSE | re.DOTALL,
-)
+ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[PX^_].*?\x1b\\|[@-Z\\-_])", re.DOTALL)
 
 
 def now_utc() -> datetime:
@@ -117,14 +70,8 @@ def iso_z(dt: datetime) -> str:
 
 
 def iso_z_ms(dt: datetime) -> str:
-    """Format a timestamp as ISO 8601 UTC with exactly three fractional
-    digits and a trailing Z, matching JavaScript's toISOString and the
-    format the Swift decoder's ISO8601DateFormatter(.withFractionalSeconds)
-    expects (it requires exactly three digits to parse at all).
-    """
     dt = dt.astimezone(timezone.utc)
-    millis = dt.microsecond // 1000
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{millis:03d}Z"
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -621,20 +568,8 @@ def parse_contributors(body: str) -> list[dict[str, Any]]:
 
 
 CLAUDE_WINDOW_KEYS = ("currentSession", "week", "weekFable")
-# The skill chip a window key's own reading produces, so dropping the window
-# (see merge_snapshot's authoritative_windows) also drops its chip.
 WINDOW_SKILL_NAMES = {"weekFable": "Limit · Fable weekly"}
-# Fallback labels for matching a rateLimitExpired sentence back to its window.
-# bloom-usage-statusline-tap's expireRateLimitWindows pushes two forms per
-# expired window: the bare key literal the Swift UI matches on exactly, and a
-# human sentence that starts with the window's own label (e.g. "Fable weekly
-# reset Sep 9 4 PM"). Used only when `existing` no longer carries the window
-# itself (already expired) and so has no "label" field to read.
-WINDOW_LABELS = {
-    "currentSession": "5-hour limit",
-    "week": "Weekly · all models",
-    "weekFable": "Fable weekly",
-}
+WINDOW_LABELS = {"currentSession": "5-hour limit", "week": "Weekly · all models", "weekFable": "Fable weekly"}
 
 
 def _rate_limit_entry_prefixes(key: str, existing: dict[str, Any]) -> set[str]:
@@ -666,18 +601,7 @@ def _reset_minute(reset_at: Any) -> datetime | None:
 
 
 def _merge_monotonic_window(existing_window: Any, official_window: Any) -> Any:
-    """The official reading is the truth as of its capture time.
-
-    Usage is normally monotonic within one window, so an existing reading
-    that shares the official resetAt (to the minute), carries a higher
-    usedPct AND was observed after the official capture is kept: usage grew
-    between the official fetch and now. An existing reading that is higher
-    but OLDER than the official capture is replaced: the account was reset
-    mid-window (bought reset, support reset) without moving resets_at, and
-    the old high number is simply stale (the 99% weekly bar on 2026-10-04
-    after the official endpoint said 2%). A different or later resetAt is a
-    new window, so the official reading wins outright.
-    """
+    """Keep a higher existing reading only when observed after the official capture."""
     if not isinstance(official_window, dict):
         return official_window
     tagged_official = {**official_window, "source": "official"}
@@ -704,18 +628,7 @@ def merge_snapshot(
     official: dict[str, Any],
     authoritative_windows: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Merge an official reading onto the live snapshot.
-
-    `authoritative_windows` is the set of currentSession/week/weekFable keys
-    the official reading actually carries. Only the API path passes it: a
-    successful API response is authoritative for the whole Claude window
-    set, so any of those three keys it did NOT carry must be deleted here
-    instead of surviving the {**existing, **official} spread below under
-    this fetch's fresh stamp. Left at the default None, nothing beyond what
-    the dict spread already overwrites is touched -- the PTY path's existing
-    behaviour, since a PTY read only ever shows whichever windows happened
-    to render and never claims to speak for the ones that did not.
-    """
+    """Merge an official reading onto the live snapshot."""
     if not official:
         return existing
     merged = {**existing, **official}
@@ -797,22 +710,9 @@ def dedupe_ranked(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def merge_and_write(
-    official: dict[str, Any],
-    max_attempts: int = 3,
-    authoritative_windows: set[str] | None = None,
+    official: dict[str, Any], max_attempts: int = 3, authoritative_windows: set[str] | None = None
 ) -> dict[str, Any]:
-    """Merge the official reading onto the live snapshot and write it.
-
-    The statusline tap re-stamps claude-usage.json every few minutes. A fetch
-    that reads the file, spends time on the network, and then blindly
-    overwrites it can clobber a tap write that landed in between. Before
-    accepting the merge as final, this re-reads the file; if its updatedAt
-    moved since the copy the merge was built from, it merges again onto the
-    fresh copy, up to max_attempts times.
-
-    `authoritative_windows` is forwarded to merge_snapshot() unchanged on
-    every attempt -- see its docstring.
-    """
+    """Merge official onto USAGE_PATH, retrying if a statusline tap wrote mid-fetch."""
     existing = read_json(USAGE_PATH)
     merged = merge_snapshot(existing, official, authoritative_windows)
     for _ in range(max_attempts):
@@ -880,84 +780,111 @@ def window_metric_from_reset(
     }
 
 
-def resolve_keychain_account() -> str:
-    account = os.environ.get("BLOOM_CLAUDE_KEYCHAIN_ACCOUNT")
-    if account:
-        return account
-    account = os.environ.get("USER")
-    if account:
-        return account
-    return os.getlogin()
-
-
-def claude_code_installed() -> bool:
-    """Claude Code creates ~/.claude on first run; without it there is no login to read."""
-    return (HOME / ".claude").exists()
-
-
-def resolve_credential() -> str | None:
-    """Resolve the Claude Code OAuth bearer token.
-
-    Checks CLAUDE_CODE_OAUTH_TOKEN first, then the macOS Keychain generic
-    password for service "Claude Code-credentials". Never reads or uses a
-    refresh token: Claude Code owns its own token refresh, so a stale access
-    token is reported as an honest status instead of being renewed here.
-    """
-    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if env_token:
-        return env_token
-
+def resolve_keychain_account() -> str | None:
+    for key in ("BLOOM_CLAUDE_KEYCHAIN_ACCOUNT", "USER", "LOGNAME"):
+        if account := (os.environ.get(key) or "").strip():
+            return account
     try:
-        account = resolve_keychain_account()
+        if pw_name := pwd.getpwuid(os.getuid()).pw_name.strip():
+            return pw_name
+    except (KeyError, OSError):
+        pass
+    try:
+        return os.getlogin().strip() or None
     except OSError:
         return None
 
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
-            capture_output=True,
-            text=True,
-            timeout=KEYCHAIN_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
 
-    raw_value = result.stdout.strip()
-    if not raw_value:
-        return None
+def claude_config_dirs() -> list[Path]:
+    custom = [Path(p.strip()).expanduser() for p in (os.environ.get("CLAUDE_CONFIG_DIR") or "").split(",") if p.strip()]
+    return list(dict.fromkeys([*custom, HOME / ".claude", HOME / ".config" / "claude"]))
+
+
+def claude_code_installed() -> bool:
+    """Claude Code creates ~/.claude (or CLAUDE_CONFIG_DIR) on first run."""
+    return any(d.exists() for d in claude_config_dirs())
+
+
+def keychain_services() -> list[str]:
+    custom = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if not custom:
+        return [KEYCHAIN_SERVICE]
+    suffix = hashlib.sha256(os.path.abspath(os.path.expanduser(custom)).encode("utf-8")).hexdigest()[:8]
+    hashed = f"{KEYCHAIN_SERVICE}-{suffix}"
+    return [hashed, KEYCHAIN_SERVICE] if hashed != KEYCHAIN_SERVICE else [KEYCHAIN_SERVICE]
+
+
+def _extract_oauth_token(raw_value: str) -> tuple[str | None, bool]:
     try:
-        credential = json.loads(raw_value)
+        credential = json.loads(raw_value.strip())
     except json.JSONDecodeError:
-        return None
-    oauth = (credential or {}).get("claudeAiOauth") or {}
-    token = oauth.get("accessToken")
+        return None, False
+    if not isinstance(credential, dict):
+        return None, False
+    oauth = credential.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None, True
     expires = oauth.get("expiresAt")
     if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > 0:
         LAST_CREDENTIAL["expiresAtMs"] = int(expires)
-    return token or None
+    token = oauth.get("accessToken")
+    return (token.strip(), False) if isinstance(token, str) and token.strip() else (None, True)
 
 
-# What the last resolve_credential() saw besides the token: only the access
-# token's expiry (a timestamp, not a secret). Claude Code's access token lives
-# about 8 hours and only Claude Code renews it, when a session runs. On a Mac
-# where no Claude Code session ran for 8 hours the Keychain holds an expired
-# token: calling the endpoint with it gets 401s, and repeated 401s earn hour-long
-# 429s that outlive the renewal. So an expired token is never sent; the lane
-# says so in plain words and re-checks the Keychain each run, fetching the
-# moment the expiry moves forward.
+def resolve_credential() -> str | None:
+    """Resolve the Claude Code OAuth bearer token (strictly read-only)."""
+    if env_token := (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip():
+        LAST_CREDENTIAL["lookup"] = "env"
+        return env_token
+    account = resolve_keychain_account()
+    accounts: list[str | None] = [account, None] if account else [None]
+    saw_locked = saw_empty = False
+    for service in keychain_services():
+        for acct in accounts:
+            cmd = ["security", "find-generic-password", "-s", service, *(["-a", acct] if acct else []), "-w"]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT_SECONDS, check=False)
+            except subprocess.TimeoutExpired:
+                saw_locked = True
+                continue
+            except OSError:
+                break
+            if res.returncode == 0:
+                token, empty = _extract_oauth_token(res.stdout)
+                if token:
+                    LAST_CREDENTIAL["lookup"] = "keychain"
+                    return token
+                saw_empty = saw_empty or empty
+                continue
+            err = (res.stderr or "").lower()
+            if res.returncode in (36, 128) or "interaction is not allowed" in err or "locked" in err:
+                saw_locked = True
+    for config_dir in claude_config_dirs():
+        cred_file = config_dir / ".credentials.json"
+        try:
+            if cred_file.is_symlink() or not cred_file.is_file():
+                continue
+            token, empty = _extract_oauth_token(cred_file.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if token:
+            LAST_CREDENTIAL["lookup"] = "credentials_file"
+            return token
+        saw_empty = saw_empty or empty
+    LAST_CREDENTIAL["lookup"] = "keychain_locked" if saw_locked else ("empty_oauth" if saw_empty else "not_found")
+    return None
+
+
 LAST_CREDENTIAL: dict[str, Any] = {}
-
-# Statuses that wait for Claude Code to change its credential rather than for
-# a timer. A run with the same credential stamp skips the endpoint entirely.
 CREDENTIAL_WAIT_STATUSES = ("token_expired", "unauthorized")
 
 
-def credential_stamp() -> str | None:
-    expires = LAST_CREDENTIAL.get("expiresAtMs")
-    return str(expires) if expires else None
+def credential_stamp(token: str | None = None) -> str | None:
+    if expires := LAST_CREDENTIAL.get("expiresAtMs"):
+        return str(expires)
+    if token and LAST_CREDENTIAL.get("lookup") != "env":
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    return None
 
 
 def simulate_api_outcome(status_value: str) -> dict[str, Any]:
@@ -1183,37 +1110,14 @@ def build_api_payload(body: dict[str, Any], captured_at: datetime) -> dict[str, 
 
 
 def _write_aborted_status(captured_at: datetime) -> int:
-    """Shared abort path for a SIGTERM landing mid-run in API mode.
-
-    Mirrors the PTY path's "aborted" handling: the caller's own timeout
-    (bloom-usage-capture.sh, the live-scrape launchd job) decided this attempt
-    ran too long, so this records an honest status and stops before anything
-    half-finished gets merged into the snapshot. Routed through the same
-    failure cooldown as unauthorized/no_credential/offline/unparsed: a caller
-    whose timeout is set too tight would otherwise retry this on an
-    unthrottled loop.
-    """
     return _write_failure_cooldown_status(
-        "aborted",
-        "official Claude usage API fetch stopped before it completed",
-        captured_at,
+        "aborted", "official Claude usage API fetch stopped before it completed", captured_at
     )
 
 
 def _write_failure_cooldown_status(
-    status: str,
-    message: str,
-    captured_at: datetime,
-    extra: dict[str, Any] | None = None,
+    status: str, message: str, captured_at: datetime, extra: dict[str, Any] | None = None
 ) -> int:
-    """Durable failures (no credential, a revoked token, the endpoint being
-    unreachable) are not transient the way a rate limit is: nothing about
-    retrying in 120s makes a dead Keychain entry or an expired token work.
-    These share the same cooldown file the rate-limited path uses, at the
-    longer API_FAILURE_COOLDOWN_SECONDS interval, so every caller that
-    already throttles on that file backs off instead of hammering the
-    Keychain and the endpoint on a fixed short loop.
-    """
     retry_at = now_utc() + timedelta(seconds=API_FAILURE_COOLDOWN_SECONDS)
     set_rate_limit_cooldown(retry_at)
     write_official_status(status, message, captured_at, retry_at, exit_code=0, extra=extra)
@@ -1223,22 +1127,20 @@ def _write_failure_cooldown_status(
 
 def run_api_mode(force: bool = False) -> int:
     captured_at = now_utc()
+    manual = force or os.environ.get("CODEX_USAGE_HUD_MANUAL_REFRESH") == "1"
+    previous_status = read_json(OFFICIAL_STATUS_PATH)
     if not force:
-        # Cheap to call on a loop only because these two gates exist: the
-        # shared cooldown (a failure or 429 someone already recorded) and the
-        # reading's own age. Neither touches the status file; a skip is not
-        # an observation.
         cooldown_until = rate_limit_cooldown_until()
         if cooldown_until and cooldown_until > captured_at:
-            print(f"Claude official usage skipped: cooldown until {iso_z(cooldown_until)}")
-            return 0
+            if not manual or previous_status.get("status") == "rate_limited":
+                print(f"Claude official usage skipped: cooldown until {iso_z(cooldown_until)}")
+                return 0
         reading_at = official_reading_captured_at()
-        if reading_at and (captured_at - reading_at).total_seconds() <= OFFICIAL_MAX_AGE_SECONDS:
+        max_age = 60 if (manual and previous_status.get("status") == "ok") else (0 if manual else OFFICIAL_MAX_AGE_SECONDS)
+        if max_age > 0 and reading_at and (captured_at - reading_at).total_seconds() <= max_age:
             print(f"Claude official usage skipped: reading {int((captured_at - reading_at).total_seconds())}s old")
             return 0
     if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not claude_code_installed():
-        # Claude Code was never installed here: the lane is absent, not broken.
-        # No Keychain read, no cooldown, no failure counter.
         message = "Claude Code is not installed on this Mac; the Claude lane stays hidden."
         write_official_status("not_installed", message, captured_at, exit_code=0)
         print(message)
@@ -1248,40 +1150,35 @@ def run_api_mode(force: bool = False) -> int:
     if _terminate_requested:
         return _write_aborted_status(captured_at)
     if not token:
-        return _write_failure_cooldown_status(
-            "no_credential",
-            "Claude Code isn't signed in on this Mac. Open Claude Code and sign in; this lane fills in by itself.",
-            captured_at,
+        lookup = LAST_CREDENTIAL.get("lookup")
+        if lookup == "keychain_locked":
+            return _write_failure_cooldown_status(
+                "keychain_locked",
+                "macOS Keychain blocked background access to Claude Code's sign-in. Unlock Login Keychain or click Allow if macOS asks, then click Refresh in Usage HUD.",
+                captured_at, extra={"credentialLookup": lookup},
+            )
+        msg = (
+            "Claude is installed on this Mac, but Claude Code CLI has no local OAuth login yet (Claude Desktop chat and remote sessions don't sign in this Mac's CLI). Run `claude` in Terminal and complete `/login`; this lane fills in by itself."
+            if lookup == "empty_oauth"
+            else "Claude Code isn't signed in on this Mac (Claude Desktop chat and remote sessions don't sign in this Mac's CLI). Run `claude` in Terminal and sign in; this lane fills in by itself."
         )
-    stamp = credential_stamp()
+        return _write_failure_cooldown_status("no_credential", msg, captured_at, extra={"credentialLookup": lookup or "not_found"})
+    stamp = credential_stamp(token)
     expires_ms = LAST_CREDENTIAL.get("expiresAtMs")
     if expires_ms and expires_ms / 1000 <= captured_at.timestamp():
         expired_at = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
         write_official_status(
             "token_expired",
-            "Claude Code's sign-in on this Mac paused because Claude Code hasn't run here for a while. "
-            "Open Claude Code once and this lane catches up by itself within a minute.",
-            captured_at,
-            exit_code=0,
-            extra={"credentialStamp": stamp, "credentialExpiredAt": iso_z_ms(expired_at)},
+            "Claude Code's sign-in on this Mac paused because `claude` hasn't run here recently (Claude Desktop and remote sessions don't renew it). Open Claude Code once in Terminal and this lane catches up within a minute.",
+            captured_at, exit_code=0, extra={"credentialStamp": stamp, "credentialExpiredAt": iso_z_ms(expired_at)},
         )
         print("Claude official usage skipped: Claude Code's access token expired; waiting for Claude Code to renew it")
         return 1
-    previous_status = read_json(OFFICIAL_STATUS_PATH)
-    if (
-        not force
-        and previous_status.get("status") == "unauthorized"
-        and stamp is not None
-        and previous_status.get("credentialStamp") == stamp
-    ):
+    if not manual and previous_status.get("status") == "unauthorized" and stamp is not None and previous_status.get("credentialStamp") == stamp:
         print("Claude official usage skipped: same credential was refused; waiting for a new sign-in")
         return 0
 
     outcome = fetch_api_usage(token)
-    # Backstop, not the primary defense: urllib's own timeout
-    # (API_TIMEOUT_SECONDS, 10s) already keeps fetch_api_usage() well under
-    # the calling hook's 20s cap, but this still catches a SIGTERM that
-    # arrived while resolve_credential()'s Keychain lookup was running.
     if _terminate_requested:
         return _write_aborted_status(captured_at)
     kind = outcome.get("kind")
@@ -1305,18 +1202,12 @@ def run_api_mode(force: bool = False) -> int:
         return 1
 
     if kind == "unauthorized":
+        refused_msg = "Claude refused this Mac's local Claude Code token. Run `claude` in Terminal (use `/login` if prompted); this lane catches up automatically."
         if stamp is None:
-            # No expiry to watch (an env token): fall back to the timed cooldown.
-            return _write_failure_cooldown_status(
-                "unauthorized",
-                "Claude refused this sign-in. Open Claude Code and sign in again; this lane fills in by itself.",
-                captured_at,
-            )
-        # One refusal per credential: no timer, no hammering. The next run
-        # with a new credential (Claude Code signed in again) fetches at once.
+            return _write_failure_cooldown_status("unauthorized", refused_msg, captured_at)
         write_official_status(
             "unauthorized",
-            "Claude refused this sign-in. Open Claude Code and sign in again; this lane fills in by itself.",
+            refused_msg,
             captured_at,
             exit_code=0,
             extra={"credentialStamp": stamp},

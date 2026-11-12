@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// A deliberately small projection of diagnostics. Raw details never enter a
@@ -22,13 +23,14 @@ enum SupportReport {
 
     /// Only these known machine statuses may leave the raw diagnostics view.
     enum Issue: String {
-        case rateLimited = "rate_limited", unauthorized, noCredential = "no_credential", tokenExpired = "token_expired", offline, unparsed
+        case rateLimited = "rate_limited", unauthorized, noCredential = "no_credential", tokenExpired = "token_expired", keychainLocked = "keychain_locked", offline, unparsed
 
         var label: String {
             switch self {
             case .rateLimited: return "provider asked us to wait"
             case .unauthorized, .noCredential: return "sign-in needed"
             case .tokenExpired: return "sign-in paused until Claude Code runs"
+            case .keychainLocked: return "Keychain access needed"
             case .offline: return "connection unavailable"
             case .unparsed: return "usage response not understood"
             }
@@ -109,5 +111,53 @@ enum SupportReport {
                  "Health checks (details omitted):"] + (rows.isEmpty ? ["No completed checks. Open Help and support for setup steps."] : rows) +
                 ["", "This report contains no raw logs, file paths, account names, prompts, usage amounts or credentials.",
                  "", "What I expected:", "What happened:"]).joined(separator: "\n")
+    }
+
+    private static let allowedProviders: Set<String> = ["claude", "codex", "gemini", "grok", "local"]
+    private static let allowedStatuses: Set<String> = [
+        "ok", "ready", "available", "fresh", "healthy", "stale", "degraded", "broken", "not_set_up",
+        "unauthorized", "no_credential", "token_expired", "keychain_locked",
+        "rate_limited", "offline", "unparsed", "not_installed", "failed", "aborted", "unsettled",
+    ]
+    private static let allowedSources: Set<String> = [
+        "official_api", "official_interactive", "official_app_server", "official_pty", "local_session_log", "local_runtime_log", "statusline_tap", "statusline_event", "manual", "native_ui_observation",
+    ]
+
+    private static func safeToken(_ value: String?, allowed: Set<String>) -> String {
+        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty else { return "none" }
+        return allowed.contains(raw) ? raw : "other"
+    }
+
+    /// One-click redaction-safe diagnostics summary (strict enum allowlists; zero secrets/paths/accounts/usage).
+    static func quickDiagnostics(
+        snapshots: [UsageSnapshot], installed: Bool, openAtLogin: Bool, nodeAvailable: Bool, pythonAvailable: Bool,
+        version: String = AppInfo.resolvedMarketingVersion, build: String = BackgroundRefreshService.currentBuildNumber,
+        system: String = ProcessInfo.processInfo.operatingSystemVersionString, now: Date = Date()
+    ) -> String {
+        let known = snapshots.filter { allowedProviders.contains($0.provider.lowercased()) }
+        let rows: [String] = known.isEmpty ? ["- none loaded"] : known.map { snap in
+            let id = snap.provider.lowercased(), fresh = UsageInsights.laneFreshness(for: snap, now: now)
+            let stateWord = fresh.isNotSetUp ? "not_set_up" : (fresh.state == .live ? "live" : (fresh.state == .recent ? "recent" : "old"))
+            let age = (fresh.age.flatMap { $0.isFinite && $0 >= 0 ? ($0 < 60 ? "<1m" : LaneFreshness.short($0)) : nil }) ?? "unknown"
+            let verdict = safeToken(snap.health?.verdict, allowed: allowedStatuses)
+            let official = safeToken(snap.officialUsageStatus?.status ?? snap.providerHealth?.status, allowed: allowedStatuses)
+            return "- \(id): state=\(stateWord) age=\(age) health=\(verdict) status=\(official) source=\(safeToken(snap.sourceKind, allowed: allowedSources))"
+        }
+        return ([
+            "Usage HUD quick diagnostics", "Version: \(version) (\(build))", "macOS: \(system)",
+            "Background refresh: \(installed ? "installed" : "not_installed") · login=\(openAtLogin ? "on" : "off") · node=\(nodeAvailable ? "yes" : "no") · python=\(pythonAvailable ? "yes" : "no")",
+            "", "Lanes (states only; no usage amounts, paths, accounts or secrets):"
+        ] + rows + ["", "No tokens, credentials, file paths, account names, prompts or usage numbers are included."]).joined(separator: "\n")
+    }
+
+    @discardableResult
+    static func copyQuickDiagnostics(snapshots: [UsageSnapshot], now: Date = Date()) -> String {
+        let p = BackgroundRefreshService.Paths.resolved()
+        let text = quickDiagnostics(snapshots: snapshots, installed: BackgroundRefreshService.isInstalled(),
+                                    openAtLogin: BackgroundRefreshService.isOpenAtLoginEnabled(),
+                                    nodeAvailable: p.nodeAvailable, pythonAvailable: p.pythonAvailable, now: now)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        return text
     }
 }

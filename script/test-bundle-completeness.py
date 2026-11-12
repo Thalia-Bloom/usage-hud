@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import plistlib
 import re
 import sys
 from pathlib import Path
@@ -73,7 +74,20 @@ def main() -> int:
     if missing_refs:
         failures.append("runtime reference not bundled: " + ", ".join(missing_refs))
 
+    # One version everywhere: Info.plist, AppInfo.swift, the update feed and the built app.
+    info = plistlib.loads((ROOT / "Resources" / "Info.plist").read_bytes())
+    want = (info["CFBundleShortVersionString"], info["CFBundleVersion"])
+    swift = (ROOT / "Sources" / "CodexUsageHUD" / "AppInfo.swift").read_text()
+    if tuple(re.findall(r'(?:marketingVersion|buildNumber) = "([^"]+)"', swift)) != want:
+        failures.append(f"AppInfo.swift does not say {want}")
+    feed = (ROOT / "site" / "public" / "appcast.xml").read_text()
+    for b, v in re.findall(r"<sparkle:version>(\d+)</sparkle:version>\s*<sparkle:shortVersionString>([^<]+)<", feed):
+        if int(b) > int(want[1]) or (v == want[0]) != (b == want[1]):
+            failures.append(f"update feed item {v} (build {b}) disagrees with Info.plist {want}")
     if APP_BIN.is_dir():
+        built = plistlib.loads((APP_BIN.parents[1] / "Info.plist").read_bytes())
+        if (built["CFBundleShortVersionString"], built["CFBundleVersion"]) != want:
+            failures.append(f"built app is not {want}")
         for name in names:
             if not (APP_BIN / name).is_file():
                 failures.append(f"packaged app missing: Contents/Resources/bin/{name}")

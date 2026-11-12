@@ -25,6 +25,7 @@ final class StatusBarController {
         updateIcon(snapshots: [])
         panelController.onVisibilityChange = { [weak self] visible in
             self?.setHighlighted(visible)
+            if !visible { ComeBack.shared.panelClosed() }
         }
     }
 
@@ -44,11 +45,14 @@ final class StatusBarController {
         let visible = presentationProviders(snapshots: snapshots, budgets: budgets)
         let readings = StatusItemText.readings(providers: visible, snapshots: snapshots, budgets: budgets)
 
-        var lanes = readings.map(\.glyphLane)
-        if lanes.isEmpty {
-            lanes = ProviderCatalog.displayProviders.map { GlyphLane(name: $0.name, usedPct: nil, mode: "unknown") }
-        }
-        button.image = UsageStatusIcon.image(lanes: lanes)
+        // The plan in use: the most recently active lane with a current reading.
+        let inUse = visible.filter { $0 != "local" }
+            .compactMap { UsageInsights.snapshot(for: $0, in: snapshots) }
+            .filter { lanePace($0).used != nil && !UsageInsights.laneFreshness(for: $0).isOld }
+            .max { (UsageInsights.parseDate($0.eventAt ?? $0.updatedAt) ?? .distantPast) < (UsageInsights.parseDate($1.eventAt ?? $1.updatedAt) ?? .distantPast) }
+        let pace = lanePace(inUse)
+        let backAt = inUse.flatMap { ComeBack.shared.back($0.provider.lowercased())?.backAt }
+        button.image = UsageStatusIcon.image(left: pace.used.map { 100 - $0 }, tone: UsageStatusIcon.tone(pace, backAt: backAt))
         button.imagePosition = .imageOnly
         button.title = ""
         button.toolTip = StatusItemText.tooltip(readings)
@@ -119,10 +123,6 @@ struct StatusLaneReading: Equatable {
     var tokensToday: Int? = nil
     var isConnected: Bool = false
     var isOld: Bool = false
-
-    var glyphLane: GlyphLane {
-        GlyphLane(name: name, usedPct: weekUsed ?? sessionUsed, mode: mode, isConnected: isConnected)
-    }
 }
 
 /// Tooltip and VoiceOver text for the menu-bar item. Pure so every phrase is
@@ -241,78 +241,57 @@ enum StatusItemText {
 
 /// One menu-bar bar: a lane's weekly used % and budget mode. The name is
 /// never drawn; the tooltip and VoiceOver carry it.
-struct GlyphLane: Equatable {
-    var name: String
-    var usedPct: Double?   // nil = no reading
-    var mode: String       // green/yellow/orange/red/freeze/unknown/local
-    var isConnected = false
-}
-
-/// The menu-bar glyph: one slim bar per lane, filled from the bottom by the
-/// share of its limit used. While every lane is calm it is a monochrome
-/// template image, so the system tints it like its own icons (light and dark
-/// bars, inactive displays, the highlight while the panel is open). Only a
-/// lane that needs attention adds color, and only on that lane's fill.
+/// The menu-bar fuel gauge for the plan in use: a small battery outline
+/// filled by what's left, with "47% left" beside it. While calm it is a
+/// template image, so the system tints it like its own icons; only a plan
+/// that is running hot, almost spent or just came back adds color.
 enum UsageStatusIcon {
-    static let barWidth: CGFloat = 3
-    static let barGap: CGFloat = 2
-    static let trackHeight: CGFloat = 12
+    static let gaugeWidth: CGFloat = 17
+    static let gaugeHeight: CGFloat = 9
     static let imageHeight: CGFloat = 18
-    static let sidePad: CGFloat = 1
-    static let cornerRadius: CGFloat = 1
 
-    static func needsAttention(_ mode: String) -> Bool {
-        ["yellow", "orange", "red", "freeze"].contains(mode.lowercased())
+    /// The gauge's tone, by the panel's rules, plus green for the first hour
+    /// after a reset.
+    static func tone(_ pace: LanePace, backAt: Date?, now: Date = Date()) -> CalmTone {
+        let tone = CalmTone.make(pace, old: false, back: false)
+        if let backAt, now.timeIntervalSince(backAt) < 3600, tone != .dim { return .back }
+        return tone
     }
 
-    /// True when every lane is calm, so the glyph can be a template image.
-    static func isTemplate(lanes: [GlyphLane]) -> Bool {
-        !lanes.contains { $0.usedPct != nil && needsAttention($0.mode) }
-    }
+    static func text(left: Double) -> String { "\(StatusItemText.percent(left)) left" }
 
-    static func width(laneCount: Int) -> CGFloat {
-        let n = CGFloat(max(1, laneCount))
-        return sidePad * 2 + n * barWidth + (n - 1) * barGap
-    }
-
-    /// Fill height snapped to device pixels. A known reading always shows at
-    /// least one device pixel, so "0% used" differs from "no reading", and
-    /// nothing pads small values up (the old pill minimum made 0–39% look
-    /// the same).
-    static func fillHeight(usedPct: Double, pixelsPerPoint: CGFloat) -> CGFloat {
+    /// Inner fill width snapped to device pixels; any reading keeps one pixel
+    /// so "0% left" still differs from no reading.
+    static func fillWidth(left: Double, pixelsPerPoint: CGFloat) -> CGFloat {
         let scale = max(1, pixelsPerPoint)
-        let fraction = CGFloat(max(0, min(1, usedPct.isFinite ? usedPct / 100 : 0)))
-        let snapped = (trackHeight * fraction * scale).rounded() / scale
-        return min(trackHeight, max(1 / scale, snapped))
+        let inner = gaugeWidth - 4
+        let fraction = CGFloat(max(0, min(1, left.isFinite ? left / 100 : 0)))
+        return min(inner, max(1 / scale, (inner * fraction * scale).rounded() / scale))
     }
 
-    static func image(lanes: [GlyphLane]) -> NSImage {
-        let template = isTemplate(lanes: lanes)
-        let size = NSSize(width: width(laneCount: lanes.count), height: imageHeight)
-
-        // Drawn on demand, not baked: labelColor and the attention colors
-        // resolve in the menu bar's own appearance every time it draws.
+    static func image(left: Double?, tone: CalmTone) -> NSImage {
+        let template = tone == .calm || tone == .dim || left == nil
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let label = left.map { text(left: $0) } ?? ""
+        let textWidth = label.isEmpty ? 0 : ceil((label as NSString).size(withAttributes: [.font: font]).width) + 4
+        let size = NSSize(width: gaugeWidth + 2 + textWidth, height: imageHeight)
+        // Drawn on demand, not baked: labelColor and the tone colors resolve
+        // in the menu bar's own appearance every time it draws.
         let image = NSImage(size: size, flipped: false) { _ in
             let pixelsPerPoint = NSGraphicsContext.current.map { abs($0.cgContext.userSpaceToDeviceSpaceTransform.a) } ?? 2
             let ink: NSColor = template ? .black : .labelColor
-            let trackY = ((imageHeight - trackHeight) / 2).rounded(.down)
-
-            for (index, lane) in lanes.enumerated() {
-                let x = sidePad + CGFloat(index) * (barWidth + barGap)
-                let track = NSRect(x: x, y: trackY, width: barWidth, height: trackHeight)
-                let trackPath = NSBezierPath(roundedRect: track, xRadius: cornerRadius, yRadius: cornerRadius)
-                let hasSignal = lane.usedPct != nil || lane.isConnected
-                ink.withAlphaComponent(hasSignal ? 0.24 : 0.11).setFill()
-                trackPath.fill()
-
-                guard let used = lane.usedPct else { continue }
-                let fill = NSRect(x: x, y: trackY, width: barWidth, height: fillHeight(usedPct: used, pixelsPerPoint: pixelsPerPoint))
-                NSGraphicsContext.saveGraphicsState()
-                trackPath.addClip()
-                let color = !template && needsAttention(lane.mode) ? modeColor(lane.mode) : ink
+            let color = template ? ink : toneColor(tone)
+            let y = ((imageHeight - gaugeHeight) / 2).rounded(.down)
+            let outline = NSBezierPath(roundedRect: NSRect(x: 1.5, y: y + 0.5, width: gaugeWidth - 1, height: gaugeHeight - 1), xRadius: 2.5, yRadius: 2.5)
+            outline.lineWidth = 1.2
+            (left == nil ? ink.withAlphaComponent(0.35) : color).setStroke()
+            outline.stroke()
+            if let left {
                 color.setFill()
-                NSBezierPath(rect: fill).fill()
-                NSGraphicsContext.restoreGraphicsState()
+                NSBezierPath(roundedRect: NSRect(x: 3, y: y + 2, width: fillWidth(left: left, pixelsPerPoint: pixelsPerPoint), height: gaugeHeight - 4),
+                             xRadius: 1, yRadius: 1).fill()
+                (label as NSString).draw(at: NSPoint(x: gaugeWidth + 5, y: ((imageHeight - font.capHeight) / 2).rounded() - 2),
+                                         withAttributes: [.font: font, .foregroundColor: ink])
             }
             return true
         }
@@ -320,15 +299,12 @@ enum UsageStatusIcon {
         return image
     }
 
-    /// Fill color for a lane that needs attention. Each has a deeper shade
-    /// for light menu bars so amber and orange keep contrast on white.
-    static func modeColor(_ mode: String) -> NSColor {
-        switch mode.lowercased() {
-        case "yellow": return dynamic(light: (0.80, 0.55, 0.00), dark: (1.00, 0.80, 0.24))
-        case "orange": return dynamic(light: (0.90, 0.40, 0.04), dark: (1.00, 0.60, 0.26))
-        case "red":    return dynamic(light: (0.84, 0.16, 0.15), dark: (1.00, 0.42, 0.40))
-        case "freeze": return dynamic(light: (0.46, 0.34, 0.92), dark: (0.72, 0.62, 1.00))
-        default:       return .labelColor
+    static func toneColor(_ tone: CalmTone) -> NSColor {
+        switch tone {
+        case .hot: return dynamic(light: (0.70, 0.45, 0.00), dark: (1.00, 0.80, 0.24))  // 3.9:1 on a white bar
+        case .spent: return dynamic(light: (0.84, 0.16, 0.15), dark: (1.00, 0.42, 0.40))
+        case .back: return dynamic(light: (0.10, 0.60, 0.36), dark: (0.24, 0.86, 0.59))
+        default: return .labelColor
         }
     }
 

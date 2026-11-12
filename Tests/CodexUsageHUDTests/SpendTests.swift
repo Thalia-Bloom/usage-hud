@@ -368,6 +368,23 @@ final class SpendTests: XCTestCase {
         XCTAssertEqual(line.paid, "you pay \(SpendDisplay.money(200 * 7 / SpendPeriods.daysPerMonth)) of $200/mo")
         XCTAssertEqual(line.multiple, "8.7×")
         XCTAssertFalse(line.showSetPlan)
+        XCTAssertTrue(line.isWin)
+    }
+
+    func testWeeklyWinHidesWhenWorkIsWorthLessThanThePlans() {
+        let paid = 200 * 7 / SpendPeriods.daysPerMonth
+        let plans = ["claude": ResolvedPlan.resolve(choice: .plan("claude-max-20x"), detected: nil)]
+        var file = TokenLogFile(tool: .claude, sessionID: "t", project: "alpha")
+        file.events = [event(2, output: 1_000_000)]
+        let small = try! XCTUnwrap(SpendDisplay.valueLine(SpendSummary.make(scan: scanWith([file]), plans: plans, now: now, calendar: utc),
+                                                          visibleProviders: ["claude"]))
+        XCTAssertLessThan(small.valueUSD ?? 0, paid)
+        XCTAssertFalse(small.isWin, "less work than the plan costs reads as a loss")
+        let none = try! XCTUnwrap(SpendDisplay.valueLine(SpendSummary.make(scan: scanWith([]), plans: plans, now: now, calendar: utc),
+                                                         visibleProviders: ["claude"]))
+        XCTAssertEqual(none.value, "$0")
+        XCTAssertFalse(none.isWin, "never \"$0 of work for $92\"")
+        XCTAssertTrue(SpendDisplay.ValueLine(value: nil, reading: true).isWin, "still reading keeps its line")
     }
 
     func testNoPlanShowsAPIValueAndASetPlanLink() {

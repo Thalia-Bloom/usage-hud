@@ -5,18 +5,26 @@ import SwiftUI
 struct HelpSettingsPane: View {
     @ObservedObject var state: UsageState
     @ObservedObject var jobs: BackgroundJobsModel
+    @State private var copiedQuick = false
 
     var body: some View {
         Form {
             Section {
                 LabeledContent {
-                    Button("Run health check") { jobs.run(.diagnostics, state: state) }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(jobs.busy)
-                        .accessibilityIdentifier("support.healthCheck")
+                    HStack(spacing: 8) {
+                        Button(copiedQuick ? "Copied" : "Copy diagnostics") {
+                            SupportReport.copyQuickDiagnostics(snapshots: state.snapshots)
+                            copiedQuick = true
+                        }
+                        .accessibilityIdentifier("support.copyQuickDiagnostics")
+                        Button("Run health check") { jobs.run(.diagnostics, state: state) }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(jobs.busy)
+                            .accessibilityIdentifier("support.healthCheck")
+                    }
                 } label: {
                     Text("Missing or old readings?")
-                    Text("Find out what needs attention and what to do next.")
+                    Text("Find out what needs attention, or copy safe diagnostics (no secrets).")
                 }
                 if jobs.busy {
                     HStack(spacing: 8) {

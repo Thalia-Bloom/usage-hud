@@ -6,6 +6,26 @@
     <description>Usage HUD updates. script/package_release.sh adds one item per notarized release.</description>
     <language>en</language>
     <item>
+      <title>Usage HUD 1.3.6</title>
+      <link>https://hud.thaliabloom.com/</link>
+      <sparkle:version>17</sparkle:version>
+      <sparkle:shortVersionString>1.3.6</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description sparkle:format="plain-text">Usage HUD 1.3.6 (build 17).</description>
+      <pubDate>Thu, 12 Nov 2026 07:38:26 GMT</pubDate>
+      <enclosure url="https://github.com/Thalia-Bloom/usage-hud/releases/download/v1.3.6/UsageHUD.zip" length="6420276" type="application/octet-stream" sparkle:edSignature="ojZU1Z3iDxXHi0V3hKDiVeE6UB7NpYd5JjSz7wfdeakFJaVz8UKNT5mMwWzbByAZ9KXrzpUbo1vpAMHO6G/nDQ==" />
+    </item>
+    <item>
+      <title>Usage HUD 1.3.5</title>
+      <link>https://hud.thaliabloom.com/</link>
+      <sparkle:version>16</sparkle:version>
+      <sparkle:shortVersionString>1.3.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description sparkle:format="plain-text">Usage HUD 1.3.5 (build 16).</description>
+      <pubDate>Thu, 12 Nov 2026 04:01:38 GMT</pubDate>
+      <enclosure url="https://github.com/Thalia-Bloom/usage-hud/releases/download/v1.3.5/UsageHUD.zip" length="6283359" type="application/octet-stream" sparkle:edSignature="6FSTyUi9KLlQsqitE+eMVXc9VVKjYIt9t51UmS4098UciMzF3LGrjgYwpRIGqn5nibBHudfa4djUHnyZVMkGAQ==" />
+    </item>
+    <item>
       <title>Usage HUD 1.3.4</title>
       <link>https://hud.thaliabloom.com/</link>
       <sparkle:version>15</sparkle:version>

@@ -9,10 +9,6 @@ enum LaunchdTemplateRenderer {
         var appExecutable: String
     }
 
-    /// Every rendered job names the app, so System Settings › Login Items
-    /// lists "Usage HUD" instead of "bash".
-    static let associatedBundleIdentifier = "com.codexusagehud.app"
-
     /// Prefix of every job's `bash -c` script (launchd/*.plist). `$0` is the
     /// job label and `$1` the recorded app executable, both passed as their
     /// own ProgramArguments so no path is ever spliced into shell source.
@@ -41,7 +37,4 @@ enum LaunchdTemplateRenderer {
             .replacingOccurrences(of: ">", with: "&gt;")
     }
 
-    static func sourceContainsPlaceholderLeak(_ template: String, forbidden: String) -> Bool {
-        template.contains(forbidden)
-    }
 }

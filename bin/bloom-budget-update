@@ -71,6 +71,11 @@ run_writer() {
 if [ "${BLOOM_USAGE_ALLOW_CLAUDE_BACKGROUND_FETCH:-0}" = "1" ]; then
   run_writer "claude-fetch" "$(helper bloom-usage-fetch-claude-official)" || true
   run_writer "claude-writer" "$NODE_BIN" "$(helper bloom-usage-write-claude)" || true
+elif [ "${CODEX_USAGE_HUD_MANUAL_REFRESH:-0}" = "1" ]; then
+  "$(helper bloom-usage-fetch-claude-official)" --mode api >/dev/null 2>&1 || true
+  if [ -d "${HOME}/.claude" ] || [ -f "$STATE_DIR/claude-usage.json" ]; then
+    run_writer "claude-writer" "$NODE_BIN" "$(helper bloom-usage-write-claude)" || true
+  fi
 fi
 
 run_writer "codex-writer" "$NODE_BIN" "$(helper bloom-usage-write-codex)" || true

@@ -127,7 +127,6 @@ enum RuntimeDependencies {
 
     static var commandLineToolsInstalled: Bool { probeCommandLineTools() }
 
-    static let commandLineToolsInstallHint = "Install Command Line Tools: run xcode-select --install"
     static let nodeInstallHint = "Install Node.js 18+ from nodejs.org or Homebrew"
 
     static func which(_ name: String, path: String, fileManager: FileManager = .default) -> URL? {

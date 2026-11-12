@@ -358,6 +358,26 @@ struct UsageSnapshot: Identifiable, Decodable, Sendable {
 @MainActor
 final class UsageState: ObservableObject {
     let resetPings = ResetPingController()
+    let mobileSnapshot = ICloudSnapshotPublisher()
+    @Published private(set) var showOnMobile = false
+
+    func setShowOnMobile(_ enabled: Bool) {
+        mobileSnapshot.setEnabled(enabled)
+        showOnMobile = enabled
+        publishMobileSnapshot()
+    }
+
+    private func publishMobileSnapshot() {
+        // Isolated fixtures and offscreen renderers must never touch iCloud.
+        guard !UsagePaths.isIsolatedStateDir,
+              !ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("CODEX_USAGE_HUD_") && $0.contains("SNAPSHOT") }),
+              ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        mobileSnapshot.initializeAfterSetup(BackgroundRefreshService.isInstalled())
+        showOnMobile = mobileSnapshot.enabled
+        guard showOnMobile else { return }
+        mobileSnapshot.publish(.make(snapshots: snapshots, selection: ProviderPreferences.selection(),
+                                    mac: Host.current().localizedName ?? "Mac"))
+    }
 
     @Published private(set) var snapshots: [UsageSnapshot] = []
     @Published private(set) var lastLoadedAt: Date?
@@ -370,6 +390,7 @@ final class UsageState: ObservableObject {
     @Published private(set) var setupBusy = false
     @Published private(set) var isManualRefreshing = false
     @Published private(set) var manualRefreshFeedback: ManualRefreshFeedback?
+    @Published var activeRecoveryProvider: String?
     /// API value and plans from the token readers. Nil until the first scan
     /// of the session logs finishes (it runs off the main thread).
     @Published private(set) var spend: SpendSummary?
@@ -524,14 +545,10 @@ final class UsageState: ObservableObject {
         }
     }
 
-    func setOverride(minutes: Int) {
-        BudgetOverride.setUntil(Date().addingTimeInterval(TimeInterval(minutes * 60)))
-        overrideUntil = BudgetOverride.activeUntil()
-    }
-
-    func clearOverride() {
-        BudgetOverride.clear()
-        overrideUntil = nil
+    func toggleRecovery(for provider: String) {
+        let id = provider.lowercased()
+        activeRecoveryProvider = (activeRecoveryProvider == id) ? nil : id
+        NotificationCenter.default.post(name: PanelMetrics.heightDidChange, object: nil)
     }
 
     deinit {
@@ -600,7 +617,13 @@ final class UsageState: ObservableObject {
         budget = prepared.budgets["claude"]
         overrideUntil = prepared.overrideUntil
         if prepared.spend != nil || spend == nil { spend = prepared.spend }
+        if let active = activeRecoveryProvider,
+           let snap = UsageInsights.snapshot(for: active, in: snapshots),
+           !UsageInsights.laneFreshness(for: snap).needsAttention {
+            activeRecoveryProvider = nil
+        }
         ReadmeBadge.shared.sync(snapshots)
+        publishMobileSnapshot()
         onSnapshotsChange?(snapshots)
         reconcileSetupCard()
     }

@@ -351,7 +351,7 @@ def test_health_stays_degraded_for_durable_status_despite_fresh_tap() -> None:
     # unauthorized and no_credential are durable failures that need a human
     # (re-open Claude Code / re-auth). A fresh tap event must not paper over
     # that with a "fresh" verdict the way it does for transient failures.
-    for durable_status in ("unauthorized", "no_credential"):
+    for durable_status in ("unauthorized", "no_credential", "keychain_locked"):
         with tempfile.TemporaryDirectory(prefix="usage-claude-keepalive-health-durable-") as raw:
             root = Path(raw)
             home = root / "home"

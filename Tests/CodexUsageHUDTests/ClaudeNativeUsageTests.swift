@@ -198,7 +198,7 @@ final class ClaudeNativeUsageTests: XCTestCase {
 
     // MARK: - Credential and request
 
-    func testCredentialReadsEnvFirstThenKeychainExactlyLikeThePython() {
+    func testCredentialReadsEnvFirstThenKeychainExactlyLikeThePython() throws {
         var calls: [[String]] = []
         let keychainValue = Data(#"{"claudeAiOauth":{"accessToken":"kc-token","refreshToken":"never-used","expiresAt":1}}"#.utf8)
         let fromEnv = ClaudeNativeCredential.resolve(env: ["CLAUDE_CODE_OAUTH_TOKEN": "env-token"], account: "me") { calls.append($0); return nil }
@@ -216,7 +216,18 @@ final class ClaudeNativeUsageTests: XCTestCase {
         XCTAssertNil(ClaudeNativeCredential.resolve(env: [:], account: "me") { _ in .init(status: 0, stdout: Data("not json".utf8)) })
         XCTAssertNil(ClaudeNativeCredential.resolve(env: [:], account: "me") { _ in .init(status: 0, stdout: Data(#"{"claudeAiOauth":{}}"#.utf8)) })
         XCTAssertNil(ClaudeNativeCredential.resolve(env: [:], account: "me") { _ in nil }, "a timed-out lookup is no credential")
+        XCTAssertEqual(ClaudeNativeCredential.lastLookupOutcome, .keychainLocked)
         XCTAssertNil(ClaudeNativeCredential.resolve(env: [:], account: nil) { _ in .init(status: 0, stdout: keychainValue) })
+
+        // Service-only Keychain fallback when account name differs, and read-only .credentials.json fallback.
+        let svcFallback = ClaudeNativeCredential.resolve(env: [:], account: "wrong") { args in
+            args.contains("-a") ? .init(status: 44, stdout: Data()) : .init(status: 0, stdout: keychainValue)
+        }
+        XCTAssertEqual(svcFallback, "kc-token")
+        let credFile = try tempDir("creds").appendingPathComponent(".credentials.json")
+        try Data(#"{"claudeAiOauth":{"accessToken":"file-token"}}"#.utf8).write(to: credFile)
+        XCTAssertEqual(ClaudeNativeCredential.resolve(env: [:], account: "me", credentialsFiles: [credFile]) { _ in .init(status: 44, stdout: Data()) }, "file-token")
+        XCTAssertEqual(ClaudeNativeCredential.lastLookupOutcome, .credentialsFile)
     }
 
     func testRequestSendsTheSameHeadersAsThePython() {
@@ -273,7 +284,9 @@ final class ClaudeNativeUsageTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 1_790_000_000)
         XCTAssertNotNil(ClaudeNativeThrottle.skipReason(trigger: .manual, now: now, lastAttemptAt: now.addingTimeInterval(-59), lastStatus: "ok", retryAt: nil))
         XCTAssertNil(ClaudeNativeThrottle.skipReason(trigger: .manual, now: now, lastAttemptAt: now.addingTimeInterval(-61), lastStatus: "ok", retryAt: nil))
-        // A durable failure (user may have just signed in) can be retried by hand.
+        // A durable failure (user may have just signed in) can be retried by hand, even inside the 60s floor.
+        XCTAssertNil(ClaudeNativeThrottle.skipReason(trigger: .manual, now: now, lastAttemptAt: now.addingTimeInterval(-12), lastStatus: "no_credential",
+                                                     retryAt: now.addingTimeInterval(480)))
         XCTAssertNil(ClaudeNativeThrottle.skipReason(trigger: .manual, now: now, lastAttemptAt: now.addingTimeInterval(-120), lastStatus: "unauthorized",
                                                      retryAt: now.addingTimeInterval(480)))
         XCTAssertNotNil(ClaudeNativeThrottle.skipReason(trigger: .scheduled, now: now, lastAttemptAt: now.addingTimeInterval(-700), lastStatus: "unauthorized",
@@ -359,7 +372,13 @@ final class ClaudeNativeUsageTests: XCTestCase {
         XCTAssertEqual(recorder.requests.count, 2)
         XCTAssertEqual(recorder.credentialReads, 2)
 
+        // Past the 10-minute cooldown, a scheduled tick with the SAME refused token skips the network (never hammers 401s).
+        now = start.addingTimeInterval(601 + 601)
+        guard case .fetched(status: "unauthorized", _) = reader.run(trigger: .scheduled) else { return XCTFail("expected same-stamp unauthorized") }
+        XCTAssertEqual(recorder.requests.count, 2, "same refused token must never be re-sent on scheduled ticks")
+
         // Refresh retries a durable failure once past the 60-second floor.
+        now = now.addingTimeInterval(61)
         XCTAssertEqual(reader.run(trigger: .manual), .fetched(status: "ok", message: "Claude Code official usage API parsed."))
         let recovered = try decode(readJSON(file))
         XCTAssertEqual(recovered.week?.usedPct, 10)
