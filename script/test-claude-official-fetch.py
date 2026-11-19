@@ -23,6 +23,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.dont_write_bytecode = True
 
@@ -107,7 +108,8 @@ def local_label(raw_resets_at: str, is_5h: bool) -> str:
     # The script rounds the endpoint's 22:59:59.8-style resets to the minute.
     exact = datetime.fromisoformat(text).astimezone(timezone.utc)
     rounded = (exact + timedelta(seconds=30)).replace(second=0, microsecond=0)
-    local_dt = rounded.astimezone()
+    # The fixture subprocess explicitly uses this zone; the CI host may use UTC.
+    local_dt = rounded.astimezone(ZoneInfo("America/Los_Angeles"))
     hour = local_dt.hour % 12 or 12
     meridiem = "AM" if local_dt.hour < 12 else "PM"
     if is_5h:
@@ -126,9 +128,7 @@ def test_api_mode_parses_fixture_into_expected_shape() -> None:
     week_reset = next(item["resets_at"] for item in fixture["limits"] if item["kind"] == "weekly_all")
     expected_5h_label = local_label(session_reset, is_5h=True)
     expected_week_label = local_label(week_reset, is_5h=False)
-    # Fixed against the fixture's actual clock values (data contract examples,
-    # not this fixture) so a formatting regression trips even if TZ handling
-    # elsewhere silently degrades to the wrong rule.
+    # The fixture subprocess uses Pacific time, regardless of the host timezone.
     assert expected_5h_label == "2:20 AM"
     assert expected_week_label == "Sep 9 4 PM"
 

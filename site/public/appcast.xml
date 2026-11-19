@@ -6,6 +6,16 @@
     <description>Usage HUD updates. script/package_release.sh adds one item per notarized release.</description>
     <language>en</language>
     <item>
+      <title>Usage HUD 1.3.7</title>
+      <link>https://hud.thaliabloom.com/</link>
+      <sparkle:version>18</sparkle:version>
+      <sparkle:shortVersionString>1.3.7</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description sparkle:format="plain-text">Usage HUD 1.3.7 (build 18).</description>
+      <pubDate>Thu, 19 Nov 2026 06:03:49 GMT</pubDate>
+      <enclosure url="https://github.com/Thalia-Bloom/usage-hud/releases/download/v1.3.7/UsageHUD.zip" length="6525983" type="application/octet-stream" sparkle:edSignature="x3HOAYjwDZJnVaqNzuK2mj7TeeycErKs3haxLjLq6uzanShnIwfWJ5zsdVBN7QZsbqSZ3eOJFcu+9IQU0qdbDg==" />
+    </item>
+    <item>
       <title>Usage HUD 1.3.6</title>
       <link>https://hud.thaliabloom.com/</link>
       <sparkle:version>17</sparkle:version>

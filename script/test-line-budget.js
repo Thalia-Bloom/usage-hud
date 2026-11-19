@@ -3,8 +3,8 @@
 const assert = require('assert');
 const { byDir, total } = require('./count-shipped-lines.js');
 
-/** Baseline Oct 31 2026 — shipped/run tree only (not site/ or store/). */
-const CEILING = 39400;
+/** Raised 2026-11-18 from 39400 to 40300: restored multi-bar StatusBarController and per-lane StatusPanel/LaneBars, and added ResetRadar + ResetRadarTests. */
+const CEILING = 40300;
 /** 50%+ cut target for follow-up PRs; this test does not enforce it yet. */
 const TARGET = 19450;
 

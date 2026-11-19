@@ -422,7 +422,8 @@ extension AgentSummary {
                 // The panel's word for a spent lane, so HeroVerdict's
                 // blocked set matches exactly.
                 paceStatus: eval.status == "SPENT" ? "✓ SPENT" : eval.status,
-                fresh: !eval.stale && UsageInsights.isReadingFresh(snap, within: 30 * 60, now: now)
+                fresh: !UsageInsights.laneFreshness(for: snap, now: now).needsAttention
+                    && !eval.stale && UsageInsights.isReadingFresh(snap, within: 30 * 60, now: now)
             ))
         }
 
@@ -483,16 +484,19 @@ extension AgentSummary {
         let name = UsageInsights.label(for: provider)
         let eval = evaluations[provider] ?? AgentPace.evaluate(snap, now: now)
         let raw = thresholds.mode(weekly: snap.week?.usedPct, session: snap.currentSession?.usedPct)
+        let gate = HeroVerdict.reading(for: snap, now: now)
         let hero = HeroVerdict.resolve(
             mode: raw,
             laneName: name,
-            readingFresh: UsageInsights.isReadingFresh(snap, within: 15 * 60, now: now),
+            readingFresh: gate.fresh,
             paceStatus: eval.status
         )
         var sentence = hero.tagline + "."
         if hero.mode == "check", let age = lanes.first(where: { $0.provider == provider })?.readingAge {
             if provider == "claude", snap.officialUsageStatus?.status?.lowercased() == "rate_limited" {
                 sentence += " The last \(name) reading is \(age) old; a provider cooldown is in effect, and Usage HUD retries automatically."
+            } else if let issue = UsageInsights.laneFreshness(for: snap, now: now).issue {
+                sentence += " The last \(name) reading is \(age) old (\(issue)); open Usage HUD to refresh it."
             } else {
                 sentence += " The last \(name) reading is \(age) old; open Usage HUD to refresh it."
             }

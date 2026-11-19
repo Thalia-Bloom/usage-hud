@@ -72,7 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         ProviderPreferences.ensureInitialized()
         state.onSnapshotsChange = { [weak self] snapshots in
-            ComeBack.shared.observe(snapshots)
+            ResetMemory.shared.observe(snapshots)
             self?.statusBar.updateIcon(snapshots: snapshots)
             self?.state.resetPings.process(snapshots)
         }

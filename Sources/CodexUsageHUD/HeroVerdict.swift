@@ -34,12 +34,14 @@ enum HeroVerdict {
     static func reading(for snapshot: UsageSnapshot?, now: Date = Date()) -> Reading {
         guard let snapshot else { return Reading(fresh: false, why: nil) }
         let lane = UsageInsights.laneFreshness(for: snapshot, now: now)
-        if lane.isOld {
-            if lane.issue != nil { return Reading(fresh: false, why: lane.issue) }
-            return Reading(fresh: false, why: lane.ageShort.map { "reading is \($0) old" })
+        if lane.needsAttention {
+            return Reading(fresh: false, why: lane.issue ?? lane.ageShort.map { "reading is \($0) old" })
         }
-        guard UsageInsights.isReadingFresh(snapshot, within: LaneFreshness.liveSeconds, now: now) else {
-            let age = UsageInsights.capturedDate(snapshot).map { LaneFreshness.short(now.timeIntervalSince($0)) }
+        guard let readAt = UsageInsights.readingDate(snapshot),
+              now.timeIntervalSince(readAt) <= 15 * 60,
+              UsageInsights.isReadingFresh(snapshot, within: LaneFreshness.liveSeconds, now: now) else {
+            let date = UsageInsights.readingDate(snapshot) ?? UsageInsights.capturedDate(snapshot)
+            let age = date.map { LaneFreshness.short(now.timeIntervalSince($0)) }
             return Reading(fresh: false, why: age.map { "reading is \($0) old" })
         }
         return Reading(fresh: true, why: nil)
@@ -98,7 +100,7 @@ enum HeroVerdict {
     /// verdict comes with a next move instead of only a warning. Returns nil
     /// when the primary lane is fine or no other lane clearly has room.
     static func alternative(mode: String, primary: String?, lanes: [Lane]) -> String? {
-        guard ["yellow", "orange", "red", "freeze"].contains(mode.lowercased()) else { return nil }
+        guard ["yellow", "orange", "red", "freeze", "check"].contains(mode.lowercased()) else { return nil }
         let blocked: Set<String> = pressingStatuses.union(["✓ SPENT", "NO DATA", "WAIT", "RESET PASSED"])
         let best = lanes
             .filter { $0.name != primary && $0.fresh && !blocked.contains($0.paceStatus) }

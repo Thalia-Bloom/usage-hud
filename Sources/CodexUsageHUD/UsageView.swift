@@ -52,7 +52,8 @@ struct UsageView: View {
                     } else if !setupOnly {
                         // Reset pings live on each lane's bell; the full card
                         // (history, explanation) moved to Settings.
-                        CalmPanel(state: state)
+                        StatusPanel(state: state, mode: heroMode, tagline: hero.tagline, alternative: heroAlternative,
+                                    primary: primaryBudgetSnapshot, verdictCoversPrimaryAge: heroMode.raw == "check")
                             .padding(.horizontal, HUD.lg)
 
                         if state.snapshots.contains(where: { detailProviders.contains($0.provider.lowercased()) }) {
@@ -139,6 +140,11 @@ struct UsageView: View {
                 HUD.base.opacity(0.84)
                 LinearGradient(colors: [Color.white.opacity(0.04), Color.clear], startPoint: .top, endPoint: .center)
                     .allowsHitTesting(false)
+                RadialGradient(
+                    colors: [heroMode.color.opacity(0.10), Color.clear],
+                    center: .init(x: 0.2, y: 0.02), startRadius: 4, endRadius: 260
+                )
+                .allowsHitTesting(false)
             }
         )
         .overlay(
@@ -172,6 +178,57 @@ struct UsageView: View {
 
     private var detailProviders: [String] {
         presentationSorted(UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets))
+    }
+
+    private var primaryBudgetSnapshot: UsageSnapshot? {
+        let visible = Set(detailProviders)
+        let visibleSnapshots = state.snapshots.filter { visible.contains($0.provider.lowercased()) }
+        let claude = visible.contains("claude") ? UsageInsights.snapshot(for: "claude", in: visibleSnapshots) : nil
+        if let claude, claude.week != nil || claude.currentSession != nil { return claude }
+        if let b = bindingConstraint(visibleSnapshots) {
+            return UsageInsights.snapshot(for: b.provider, in: visibleSnapshots)
+        }
+        return claude ?? visibleSnapshots.first
+    }
+
+    private var hero: HeroVerdict.Result {
+        guard let snap = primaryBudgetSnapshot else {
+            return HeroVerdict.resolve(mode: "unknown", laneName: nil, readingFresh: false, paceStatus: nil)
+        }
+        let raw: String
+        if let m = state.budgets[snap.provider.lowercased()]?.mode { raw = m }
+        else if let p = pressWindow(snap) { raw = BudgetEvaluator.fallbackModeFromHeadroom(p.headroom) }
+        else { raw = "unknown" }
+        let reading = HeroVerdict.reading(for: snap)
+        return HeroVerdict.resolve(
+            mode: raw,
+            laneName: UsageInsights.label(for: snap.provider.lowercased()),
+            readingFresh: reading.fresh,
+            paceStatus: lanePace(snap).status,
+            staleReason: reading.why
+        )
+    }
+
+    private var heroMode: ModeStyle { ModeStyle(hero.mode) }
+
+    /// "Codex has room · 22% used" under a WATCH/STOP/CHECK verdict: the next move.
+    private var heroAlternative: String? {
+        let lanes: [HeroVerdict.Lane] = detailProviders.compactMap { provider in
+            guard provider != "local",
+                  !UsageInsights.isManualObservationLane(provider, snapshots: state.snapshots),
+                  let snap = UsageInsights.snapshot(for: provider, in: state.snapshots) else { return nil }
+            let pace = lanePace(snap)
+            let fresh = UsageInsights.laneFreshness(for: snap)
+            return HeroVerdict.Lane(
+                name: UsageInsights.label(for: provider),
+                used: pace.historical || pace.derived ? nil : pace.used,
+                paceStatus: pace.status,
+                fresh: !fresh.needsAttention && (fresh.age ?? .infinity) <= 30 * 60
+                    && UsageInsights.isReadingFresh(snap, within: 30 * 60)
+            )
+        }
+        let primary = primaryBudgetSnapshot.map { UsageInsights.label(for: $0.provider.lowercased()) }
+        return HeroVerdict.alternative(mode: hero.mode, primary: primary, lanes: lanes)
     }
 }
 
@@ -289,73 +346,75 @@ private struct HeaderBar: View {
     }
 }
 
-// MARK: - Calm panel (headline, one row per plan, weekly win)
+// MARK: - Status panel (headline, per-lane pace bars, resets, weekly win)
 
-/// Glyph's B plus C panel: the answer in plain words, then one row per plan
-/// with the most room on top. One row is open at a time and the top row opens
-/// by default. The rules live in CalmPanel.swift.
-private struct CalmPanel: View {
+private struct StatusPanel: View {
     @ObservedObject var state: UsageState
-    @ObservedObject var comeBack = ComeBack.shared
-    @State private var openID: String?
-    /// Bumped when a row's window pin changes, so the rows re-read it.
-    @State private var pinRevision = 0
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private struct Item { let lane: CalmLane; let snap: UsageSnapshot; let pace: LanePace; let fresh: LaneFreshness }
+    let mode: ModeStyle
+    let tagline: String
+    let alternative: String?
+    let primary: UsageSnapshot?
+    var verdictCoversPrimaryAge = false
 
     var body: some View {
-        let _ = pinRevision
-        let items = self.items
-        let lanes = items.map(\.lane)
-        let back = lanes.first { $0.tone == .back && comeBack.back($0.id)?.seen == false }
-        let head = CalmHeadline.make(lanes, back: back)
-        let open = openID ?? lanes.first?.id
-        let headTarget: String? = lanes.allSatisfy({ !$0.tone.usable })
-            ? (items.first(where: { $0.fresh.needsAttention })?.lane.id ?? providers.first(where: { p in !items.contains { $0.lane.id == p } }))
-            : nil
-        let subTarget: String? = headTarget == nil && head.sub?.contains("fresh reading") == true
-            ? items.first(where: { $0.lane.tone == .dim && $0.fresh.needsAttention })?.lane.id : nil
-        let blockTarget = headTarget ?? subTarget
+        let heroTarget = mode.raw == "check" ? primary?.provider.lowercased() : nil
         VStack(alignment: .leading, spacing: HUD.md) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(head.title)
-                    .font(.system(size: 25, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
-                    .underline(headTarget != nil, color: HUD.ink3)
-                    .lineLimit(1).minimumScaleFactor(0.7)
-                if let sub = head.sub {
-                    Text(noWidow(sub))
-                        .font(.system(size: 12.5, weight: .medium)).foregroundStyle(subTarget != nil ? HUD.watch : HUD.ink2)
-                        .underline(subTarget != nil, color: HUD.watch.opacity(0.75))
-                        .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .center, spacing: 10) {
+                    VerdictPill(mode: mode)
+                        .help(whyHelp)
+                    Text(tagline)
+                        .font(.system(size: 19, weight: .semibold, design: .rounded))
+                        .foregroundStyle(HUD.ink)
+                        .underline(heroTarget != nil, color: HUD.ink3)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { if let heroTarget { state.toggleRecovery(for: heroTarget) } }
+                .help(heroTarget != nil ? "Click for recovery steps." : "")
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(mode.spokenWord). \(tagline)")
+                .accessibilityAddTraits(heroTarget != nil ? [.isHeader, .isButton] : .isHeader)
+                if let alternative {
+                    HStack(alignment: .center, spacing: 6) {
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(HUD.go)
+                            .accessibilityHidden(true)
+                        Text(alternative)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(HUD.ink2)
+                        Spacer(minLength: 0)
+                    }
+                    .help("Another lane you pay for has room right now. Switch to it while this one recovers.")
+                }
+                if let caveat = UsageInsights.trustCaveat(snapshots: state.snapshots, budgets: state.budgets,
+                                                          excluding: caveatExclusions) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Circle().fill(HUD.watch).frame(width: 5, height: 5)
+                            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 3.5 }
+                            .accessibilityHidden(true)
+                        Text(noWidow(caveat))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(HUD.ink3)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .help("Each lane says where its number came from. A reading marked old stopped refreshing, so it describes the past, not right now.")
                 }
             }
-            .contentShape(Rectangle())
-            .onTapGesture { if let blockTarget { state.toggleRecovery(for: blockTarget) } }
-            .help(blockTarget != nil ? "Click for recovery steps." : "")
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(blockTarget != nil ? [.isHeader, .isButton] : .isHeader)
             if let active = state.activeRecoveryProvider, let recovery = activeRecovery(for: active) {
                 LaneRecoveryCard(recovery: recovery, state: state)
             }
             FoundProviderBanner()
-            VStack(spacing: 2) {
-                ForEach(items, id: \.lane.id) { item in
-                    CalmRow(lane: item.lane, snap: item.snap, pace: item.pace, fresh: item.fresh, open: item.lane.id == open,
-                            pings: ResetPingController.providers.contains(item.lane.id) ? state.resetPings : nil,
-                            pin: { UserDefaults.standard.set($0, forKey: "hud.laneWindow.\(item.lane.id)"); pinRevision += 1 },
-                            onRecover: { state.toggleRecovery(for: item.lane.id) }) {
-                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
-                            openID = item.lane.id == open ? "" : item.lane.id
-                        }
-                    }
-                }
-                ForEach(providers.filter { p in !items.contains { $0.lane.id == p } }, id: \.self) { provider in
-                    EmptyLaneRow(provider: provider) { state.toggleRecovery(for: provider) }
-                }
-            }
-            .padding(.horizontal, -10)
-            .animation(SnapshotMode.enabled || reduceMotion ? nil : .easeOut(duration: 0.35), value: lanes.map(\.id))
+            LaneBars(state: state, pings: state.resetPings,
+                     primaryProvider: primary?.provider.lowercased(), accent: mode.color,
+                     onRecover: { state.toggleRecovery(for: $0) })
+                .padding(.top, 2)
+                .overlay(Rectangle().fill(HUD.hair).frame(height: 0.5), alignment: .top)
+            ResetsSection(state: state)
             WeeklyWin(state: state)
             PingStrip(controller: state.resetPings)
         }
@@ -367,205 +426,302 @@ private struct CalmPanel: View {
         return LaneRecovery.make(provider: provider, snapshot: snap, freshness: fresh)
     }
 
-    private var providers: [String] {
-        UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets).filter { $0 != "local" }
+    private var caveatExclusions: Set<String> {
+        guard verdictCoversPrimaryAge, let p = primary?.provider.lowercased() else { return [] }
+        return [p]
     }
 
-    private var items: [Item] {
-        let built: [Item] = providers.compactMap { p in
-            guard let snap = UsageInsights.snapshot(for: p, in: state.snapshots) else { return nil }
-            let pin = UserDefaults.standard.string(forKey: "hud.laneWindow.\(p)") ?? "auto"
-            let pace = lanePace(snap, forced: pin == "auto" ? nil : pin)
-            let fresh = UsageInsights.laneFreshness(for: snap)
-            let window = pace.windowTag == "5h" ? snap.currentSession : snap.week
-            let lane = CalmLane(id: p, name: UsageInsights.label(for: p), used: pace.used,
-                                tone: CalmTone.make(pace, old: fresh.isOld, back: comeBack.back(p) != nil),
-                                reset: window.flatMap(rowReset))
-            return Item(lane: lane, snap: snap, pace: pace, fresh: fresh)
+    private var whyHelp: String {
+        var parts: [String] = [mode.reassure]
+        if let snap = primary, let p = pressWindow(snap) {
+            let reset = shortReset(p.reset, nil).map { ", resets \($0)" } ?? ""
+            parts.append("Based on the \(UsageInsights.label(for: snap.provider)) \(p.label) limit: \(formatPercent(100 - p.headroom)) used\(reset).")
         }
-        let order = CalmHeadline.sorted(built.map(\.lane)).map(\.id)
-        return built.sorted { (order.firstIndex(of: $0.lane.id) ?? 0) < (order.firstIndex(of: $1.lane.id) ?? 0) }
+        return parts.joined(separator: "\n")
     }
 }
 
-private func rowReset(_ w: UsageSnapshot.WindowMetric) -> String? {
-    let now = Date()
-    return calmRowReset(UsageInsights.resetDate(for: w, now: now), label: w.resetLabel, now: now)
-}
-
-/// The row's reset column, short enough that it never truncates: "in 2h 10m"
-/// when close, "Wed 4:27 AM" inside a week, the date alone ("Nov 18") 7 or
-/// more days out, or when the weekday would read as today's.
-func calmRowReset(_ date: Date?, label: String?, now: Date) -> String? {
-    guard let date else { return label }
-    let remaining = date.timeIntervalSince(now)
-    if remaining > 0, remaining <= 3 * 3600 { return "in \(countdownText(remaining))" }
-    let calendar = Calendar.current
-    let sameWeekdayLater = !calendar.isDate(date, inSameDayAs: now)
-        && calendar.component(.weekday, from: date) == calendar.component(.weekday, from: now)
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "en_US_POSIX")
-    if remaining >= 7 * 24 * 3600 || sameWeekdayLater {
-        f.dateFormat = "MMM d"
-    } else {
-        f.dateFormat = Calendar.current.component(.minute, from: date) == 0 ? "EEE h a" : "EEE h:mm a"
+private struct VerdictPill: View {
+    let mode: ModeStyle
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: mode.icon).font(.system(size: 10.5, weight: .bold))
+            Text(mode.word).font(.system(size: 12.5, weight: .heavy, design: .rounded)).tracking(0.6)
+        }
+        .foregroundStyle(mode.onColor)
+        .padding(.horizontal, 11).padding(.vertical, 5)
+        .background(Capsule().fill(mode.color))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
     }
-    return f.string(from: date)
 }
 
-/// One plan: name, bar, percent used, reset. Gray unless the plan needs a
-/// look; the pace tick shows where even use would be by now. When the plan
-/// comes back the bar drains, turns green and a light sweeps it once.
-private struct CalmRow: View {
-    let lane: CalmLane
-    let snap: UsageSnapshot
-    let pace: LanePace
-    let fresh: LaneFreshness
-    let open: Bool
-    var pings: ResetPingController?
-    /// Pins the row to "auto" (closest to running out), "5h" or "wk".
-    var pin: (String) -> Void = { _ in }
-    var onRecover: () -> Void = {}
-    let toggle: () -> Void
-    @State private var shown: Double = 0
-    @State private var draining = false
-    @State private var sweep: CGFloat = -0.2
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+/// Shared column grid for every lane row, so names, bars, percentages and
+/// bells line up down the panel and sub-lines start under the bar.
+private enum LaneGrid {
+    static let name: CGFloat = 104
+    static let gap: CGFloat = 10
+    static let value: CGFloat = 42
+    static let bell: CGFloat = 16
+    static let nameText: CGFloat = 20
+    static var subLead: CGFloat { name + gap }
+    static var subTrail: CGFloat { bell + gap }
+}
 
-    private var still: Bool { SnapshotMode.enabled || reduceMotion }
-    private var window: UsageSnapshot.WindowMetric? { pace.windowTag == "5h" ? snap.currentSession : snap.week }
+private struct LaneBars: View {
+    @ObservedObject var state: UsageState
+    @ObservedObject var pings: ResetPingController
+    var primaryProvider: String?
+    var accent: Color = HUD.go
+    var onRecover: (String) -> Void = { _ in }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 10) {
-                Text(lane.name)
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(HUD.ink)
-                    .lineLimit(1)
-                    .frame(width: 62, alignment: .leading)
-                PremiumBar(fraction: shown / 100, color: draining ? HUD.stop : barColor,
-                           marker: lane.tone == .dim ? nil : pace.elapsed.map { $0 / 100 })
-                    .overlay(sweepBand)
-                Text(lane.used.map { formatPercent($0) } ?? "--")
-                    .font(.system(size: 14.5, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(draining ? HUD.stop : valueColor)
-                    .frame(width: 44, alignment: .trailing)
-                Text(lane.reset ?? "")
-                    .font(.system(size: 11.5, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(HUD.ink3)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-                    .frame(width: 80, alignment: .trailing)
-            }
-            if open {
-                detail
-            } else if fresh.needsAttention {
-                recoveryLink
+        let lanes = presentationSorted(
+            UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets)
+        )
+        if !lanes.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(lanes.enumerated()), id: \.element) { index, p in
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let snapshot = UsageInsights.snapshot(for: p, in: state.snapshots) {
+                            if p == "local" {
+                                LocalUsageBlock(snapshot: snapshot)
+                            } else {
+                                PaceBlock(provider: p, snapshot: snapshot,
+                                          isPrimary: p == primaryProvider, accent: accent,
+                                          pings: ResetPingController.providers.contains(p) ? pings : nil,
+                                          note: CreditsDisplay.laneNote(snapshot.credits),
+                                          onRecover: { onRecover(p) })
+                            }
+                            if p == "claude" {
+                                let fableExpired = snapshot.rateLimitExpired?.contains("weekFable") == true
+                                if FableDisplay.shouldShow(week: snapshot.weekFable, expired: fableExpired) {
+                                    FableRow(week: snapshot.weekFable, expired: fableExpired)
+                                }
+                            }
+                        } else {
+                            EmptyLaneRow(provider: p) { onRecover(p) }
+                        }
+                    }
+                    .padding(.vertical, 11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .top) {
+                        if index > 0 { Rectangle().fill(HUD.hairSoft).frame(height: 0.5) }
+                    }
+                }
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, open ? 10 : 8)
-        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(open ? 0.05 : 0)))
-        .contentShape(Rectangle())
-        .onTapGesture(perform: toggle)
-        .help(rowTooltip)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(LaneSpeech.lane(name: lane.name, pace: pace,
-                                            resetSpoken: laneResetSpoken(window?.resetLabel, window?.resetAt), freshness: fresh))
-        .accessibilityAddTraits(.isButton)
-        .modifier(BellAction(pings: pings, provider: lane.id))
-        .contextMenu {
-            Button("Show the closest limit") { pin("auto") }
-            Button("Show the 5-hour limit") { pin("5h") }
-            Button("Show the weekly limit") { pin("wk") }
+    }
+}
+
+private struct ResetsSection: View {
+    @ObservedObject var state: UsageState
+    @ObservedObject var resetMemory = ResetMemory.shared
+
+    var body: some View {
+        let visible = presentationSorted(UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets))
+        let items = ResetRadar.items(snapshots: state.snapshots, visibleProviders: visible, marks: resetMemory.marks)
+        if !items.isEmpty {
+            let availableCount = items.filter { $0.kind == .available }.count
+            let useSoonCount = items.filter { $0.kind == .useSoon }.count
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("Resets")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(HUD.ink2)
+                    Spacer(minLength: 0)
+                    if availableCount > 0 {
+                        Text("\(availableCount) available")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(HUD.go)
+                    } else if useSoonCount > 0 {
+                        Text("\(useSoonCount) expiring soon")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(HUD.watch)
+                    }
+                }
+                ForEach(items) { item in
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Circle()
+                            .fill(dotColor(for: item.kind))
+                            .frame(width: 6, height: 6)
+                            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 3 }
+                        Text(item.title)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(HUD.ink)
+                            .lineLimit(1)
+                        Spacer(minLength: 6)
+                        Text(item.detail)
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(detailColor(for: item.kind))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(HUD.cardFill)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(HUD.cardStroke, lineWidth: 0.5))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .accessibilityElement(children: .combine)
         }
-        .accessibilityAction(named: "Show the 5-hour limit") { pin("5h") }
-        .accessibilityAction(named: "Show the weekly limit") { pin("wk") }
-        .accessibilityAction(named: "Show the closest limit") { pin("auto") }
-        .onAppear(perform: start)
-        .onChange(of: lane.used) { _, used in withAnimation(still ? nil : .easeOut(duration: 0.5)) { shown = used ?? 0 } }
     }
 
-    @ViewBuilder private var detail: some View {
-        let lines = LaneLines.make(pace, todayNote: nil, note: CreditsDisplay.laneNote(snap.credits), freshness: fresh)
-        let fable = lane.id == "claude" && FableDisplay.shouldShow(week: snap.weekFable, expired: false)
-            ? FableDisplay.make(week: snap.weekFable, expired: false).usedPct : nil
-        let text = CalmHeadline.detail(lines, status: pace.status,
-                                       age: (fresh.age ?? 0) > 15 * 60 && !fresh.isOld ? fresh.ageShort : nil,
-                                       fable: fable.map { formatPercent($0) })
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if fresh.needsAttention {
-                recoveryLink
+    private func dotColor(for kind: ResetRadar.Kind) -> Color {
+        switch kind {
+        case .available: return HUD.go
+        case .useSoon: return HUD.watch
+        case .upcoming: return HUD.ink3
+        }
+    }
+
+    private func detailColor(for kind: ResetRadar.Kind) -> Color {
+        switch kind {
+        case .available: return HUD.go
+        case .useSoon: return HUD.watch
+        case .upcoming: return HUD.ink2
+        }
+    }
+}
+
+private func laneTitle(_ provider: String) -> String {
+    provider == "local" ? "Local" : UsageInsights.label(for: provider)
+}
+
+private struct LaneName<Accessory: View>: View {
+    let title: String
+    let dot: Color
+    var ring: Color? = nil
+    var small = false
+    @ViewBuilder var accessory: () -> Accessory
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ZStack {
+                if let ring {
+                    Circle().strokeBorder(ring.opacity(0.85), lineWidth: 1.25)
+                        .frame(width: 13, height: 13)
+                }
+                Circle().fill(dot).frame(width: small ? 5 : 7, height: small ? 5 : 7)
+            }
+            .frame(width: 13, height: 13)
+            .padding(.trailing, LaneGrid.nameText - 13)
+            Text(title)
+                .font(.system(size: small ? 11.5 : 13, weight: small ? .medium : .semibold))
+                .foregroundStyle(small ? HUD.ink2 : HUD.ink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+            Spacer(minLength: 4)
+            accessory()
+        }
+        .frame(width: LaneGrid.name, alignment: .leading)
+    }
+}
+
+extension LaneName where Accessory == EmptyView {
+    init(title: String, dot: Color, ring: Color? = nil, small: Bool = false) {
+        self.init(title: title, dot: dot, ring: ring, small: small) { EmptyView() }
+    }
+}
+
+private struct LaneSubline: View {
+    let text: String?
+    var textColor: Color = HUD.ink2
+    var freshness: LaneFreshness? = nil
+    var trust: UsageInsights.LaneTrust?
+    var indent: CGFloat = 0
+    var provider: String? = nil
+    var onRecover: (() -> Void)? = nil
+
+    var body: some View {
+        let note = freshness?.note
+        let noteColor = freshness?.needsAttention == true ? HUD.watch : HUD.ink3
+        HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
+            Group {
+                if let trust { TrustTag(trust: trust) } else { Color.clear.frame(height: 1) }
+            }
+            .padding(.leading, LaneGrid.nameText + indent)
+            .frame(width: LaneGrid.name, alignment: .leading)
+            if freshness?.needsAttention == true, let onRecover {
+                Button(action: onRecover) {
+                    (Text(text ?? "").foregroundStyle(textColor)
+                     + Text(text != nil && note != nil ? " · " : "").foregroundStyle(HUD.ink3)
+                     + Text(note ?? "").foregroundStyle(noteColor).underline(true, color: HUD.watch.opacity(0.75)))
+                        .font(.system(size: 10.5, weight: .medium))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(provider.map { "usage.lane.\($0).recovery" } ?? "")
             } else {
-                (Text(text.head.map { "\($0). " } ?? "").foregroundStyle(headColor).fontWeight(.semibold)
-                 + Text(text.rest).foregroundStyle(HUD.ink2))
-                    .font(.system(size: 12, weight: .medium))
-                    .fixedSize(horizontal: false, vertical: true)
+                (Text(text ?? "").foregroundStyle(textColor)
+                 + Text(text != nil && note != nil ? " · " : "").foregroundStyle(HUD.ink3)
+                 + Text(note ?? "").foregroundStyle(noteColor))
+                    .font(.system(size: 10.5, weight: .medium))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer(minLength: 0)
-            if let pings { PingBell(controller: pings, provider: lane.id) }
         }
+        .optionalHelp(freshness?.issueDetail)
     }
+}
 
-    private var recoveryLink: some View {
-        let agePart = fresh.isOld ? fresh.ageShort.map { "Last read \($0) ago" } : nil
-        let issuePart = fresh.issue.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? (fresh.isOld ? "How to fix" : "Check reading")
-        return Button(action: onRecover) {
-            Text([agePart, issuePart].compactMap { $0 }.joined(separator: " · "))
-                .font(.system(size: 11.5, weight: .medium)).foregroundStyle(HUD.watch)
-                .underline(true, color: HUD.watch.opacity(0.75))
-                .fixedSize(horizontal: false, vertical: true).contentShape(Rectangle())
+private extension View {
+    @ViewBuilder func optionalHelp(_ text: String?) -> some View {
+        if let text, !text.isEmpty { self.help(text) } else { self }
+    }
+}
+
+private struct TrustTag: View {
+    let trust: UsageInsights.LaneTrust
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if trust.level == "official", trust.isLive {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(HUD.go.opacity(0.8))
+            }
+            Text(trust.tagText)
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("usage.lane.\(lane.id).recovery")
+        .font(.system(size: 9.5, weight: .medium))
+        .foregroundStyle(!trust.isGap && !trust.isLive ? HUD.watch.opacity(0.9) : HUD.ink3)
+        .lineLimit(1)
+        .fixedSize()
+        .help(trust.help)
     }
+}
 
-    private var rowTooltip: String {
-        guard fresh.needsAttention else { return "" }
-        let lead = fresh.isOld ? "Last known reading (\(fresh.ageShort.map { "\($0) ago" } ?? "old")). " : ""
-        return "\(lead)\(fresh.issueDetail ?? fresh.issue ?? "") Click for recovery steps."
-    }
+private struct LocalUsageBlock: View {
+    let snapshot: UsageSnapshot
 
-    private var sweepBand: some View {
-        GeometryReader { g in
-            LinearGradient(colors: [.clear, Color.white.opacity(0.65), .clear], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 40)
-                .offset(x: sweep * g.size.width - 20)
+    var body: some View {
+        let today = snapshot.session?.todayTotal ?? 0
+        let week = snapshot.session?.weekTotal ?? 0
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
+                LaneName(title: "Local", dot: HUD.local)
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+                (Text(compactTokenCount(today)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
+                 + Text(" tokens today").font(.system(size: 10.5, weight: .medium)).foregroundStyle(HUD.ink2))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            LaneSubline(text: "\(compactTokenCount(week)) this week", textColor: HUD.ink3,
+                        trust: UsageInsights.laneTrust(for: snapshot))
         }
-        .mask(Capsule())
-        .allowsHitTesting(false)
+        .help("Tokens your local models (Ollama) read and wrote, counted from Ollama's logs on this Mac. Local models have no usage limit.")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Local models, \(compactTokenCount(today)) tokens today, \(compactTokenCount(week)) this week")
     }
-
-    private func start() {
-        let target = lane.used ?? 0
-        guard lane.tone == .back, !still, let mark = ComeBack.shared.back(lane.id), !mark.played else {
-            if still { shown = target } else { withAnimation(.easeOut(duration: 0.9).delay(0.2)) { shown = target } }
-            return
-        }
-        shown = mark.before ?? 100
-        draining = true
-        withAnimation(.easeInOut(duration: 0.8)) { shown = target }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            draining = false
-            withAnimation(.easeInOut(duration: 0.7)) { sweep = 1.2 }
-            ComeBack.shared.played(lane.id)
-        }
-    }
-
-    private var barColor: Color {
-        switch lane.tone {
-        case .calm: return Color.white.opacity(0.42)
-        case .hot: return HUD.watch
-        case .spent: return HUD.stop
-        case .back: return HUD.go
-        case .dim: return HUD.ink3.opacity(0.5)
-        }
-    }
-
-    private var valueColor: Color { lane.tone == .calm ? HUD.ink : lane.tone == .dim ? HUD.ink3 : barColor }
-    private var headColor: Color { lane.tone == .calm || lane.tone == .dim ? HUD.ink : barColor }
 }
 // MARK: - Bars (one grammar: hero, lanes, windows)
 
@@ -715,6 +871,190 @@ enum FableDisplay {
     }
 }
 
+private struct FableRow: View {
+    let week: UsageSnapshot.WindowMetric?
+    let expired: Bool
+    @State private var shown: Double = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var display: FableDisplay.Result { FableDisplay.make(week: week, expired: expired) }
+
+    var body: some View {
+        let target = display.usedPct ?? 0
+        let still = SnapshotMode.enabled || reduceMotion
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: LaneGrid.gap) {
+                LaneName(title: "Fable", dot: HUD.ink3, small: true)
+                    .padding(.leading, 12)
+                    .frame(width: LaneGrid.name, alignment: .leading)
+
+                PremiumBar(fraction: shown / 100, color: HUD.fable, height: 5,
+                           marker: display.elapsedPct.map { $0 / 100 })
+
+                Text(display.percentText)
+                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
+                    .foregroundStyle(display.usedPct == nil ? HUD.ink3 : HUD.ink2)
+                    .monospacedDigit()
+                    .frame(width: LaneGrid.value, alignment: .trailing)
+
+                Color.clear.frame(width: LaneGrid.bell, height: 1)
+            }
+            if !display.subline.isEmpty {
+                LaneSubline(text: display.usedPct == nil ? display.subline : display.resetText,
+                            textColor: HUD.ink3, freshness: display.freshness, trust: display.trust, indent: 12)
+            }
+        }
+        .help(display.helpText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(LaneSpeech.fable(display, week: week))
+        .onAppear { if still { shown = target } else { withAnimation(.easeOut(duration: 0.9).delay(0.25)) { shown = target } } }
+        .onChange(of: target) { _, _ in if still { shown = target } else { withAnimation(.easeOut(duration: 0.5)) { shown = target } } }
+    }
+}
+
+private struct PaceBlock: View {
+    let provider: String
+    let snapshot: UsageSnapshot?
+    var isPrimary = false
+    var accent: Color = HUD.go
+    var pings: ResetPingController?
+    var note: String?
+    var onRecover: () -> Void = {}
+    @State private var shown: Double = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage private var pinned: String
+
+    init(provider: String, snapshot: UsageSnapshot?, isPrimary: Bool = false, accent: Color = HUD.go,
+         pings: ResetPingController? = nil, note: String? = nil, onRecover: @escaping () -> Void = {}) {
+        self.provider = provider
+        self.snapshot = snapshot
+        self.isPrimary = isPrimary
+        self.accent = accent
+        self.pings = pings
+        self.note = note
+        self.onRecover = onRecover
+        _pinned = AppStorage(wrappedValue: "auto", "hud.laneWindow.\(provider)")
+    }
+
+    var body: some View {
+        let pace = lanePace(snapshot, preferPressing: isPrimary, forced: pinned == "auto" ? nil : pinned)
+        let freshness = UsageInsights.laneFreshness(for: snapshot)
+        let trust = UsageInsights.displayTrust(for: snapshot, historical: pace.historical, derived: pace.derived)
+        let target = pace.used ?? 0
+        let still = SnapshotMode.enabled || reduceMotion
+        let todayNote = (isPrimary && !freshness.isOld && pace.windowTag != "5h" ? snapshot.flatMap { todayRoom($0) } : nil)
+            .flatMap { $0.rowNote }
+        let lines = LaneLines.make(pace, todayNote: todayNote, note: note, freshness: freshness)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: LaneGrid.gap) {
+                LaneName(title: laneTitle(provider), dot: pace.barColor,
+                         ring: isPrimary ? accent : nil) {
+                    windowTag(pace)
+                }
+
+                PremiumBar(fraction: shown / 100, color: pace.historical ? HUD.ink3 : pace.barColor,
+                           marker: freshness.isOld ? nil : pace.elapsed.map { $0 / 100 })
+
+                Text(pace.used.map { formatPercent($0) } ?? "--")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(pace.used == nil || freshness.isOld || pace.historical ? HUD.ink3 : pace.valueColor)
+                    .monospacedDigit()
+                    .frame(width: LaneGrid.value, alignment: .trailing)
+
+                Group {
+                    if let pings {
+                        PingBell(controller: pings, provider: provider)
+                    } else {
+                        Color.clear.frame(height: 1)
+                    }
+                }
+                .frame(width: LaneGrid.bell)
+            }
+            LaneSubline(text: lines.primary, textColor: lines.primaryIsGap ? HUD.wait : HUD.ink2,
+                        freshness: freshness, trust: trust, provider: provider, onRecover: onRecover)
+            if let status = lines.status {
+                Text(status)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(pace.statusColor)
+                    .lineLimit(1)
+                    .padding(.leading, LaneGrid.subLead)
+            }
+        }
+        .help(rowHelp(pace))
+        .contextMenu {
+            Button("Show the closest limit") { pinned = "auto" }
+            Button("Show the 5-hour limit") { pinned = "5h" }
+            Button("Show the weekly limit") { pinned = "wk" }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(LaneSpeech.lane(name: UsageInsights.label(for: provider), pace: pace,
+                                            resetSpoken: spokenReset(pace), freshness: freshness))
+        .accessibilityAction(named: "Show \(nextPinName) limit") { cyclePin() }
+        .accessibilityAction(named: "Show the 5-hour limit") { pinned = "5h" }
+        .accessibilityAction(named: "Show the weekly limit") { pinned = "wk" }
+        .accessibilityAction(named: "Show the closest limit") { pinned = "auto" }
+        .modifier(BellAction(pings: pings, provider: provider))
+        .onAppear { if still { shown = target } else { withAnimation(.easeOut(duration: 0.9).delay(0.2)) { shown = target } } }
+        .onChange(of: target) { _, _ in if still { shown = target } else { withAnimation(.easeOut(duration: 0.5)) { shown = target } } }
+    }
+
+    private func spokenReset(_ pace: LanePace) -> String? {
+        guard let snapshot else { return nil }
+        let window = pace.windowTag == "5h" ? snapshot.currentSession : snapshot.week
+        guard let window else { return nil }
+        return laneResetSpoken(window.resetLabel, window.resetAt)
+    }
+
+    private var nextPinName: String {
+        switch pinned {
+        case "auto": return "5-hour"
+        case "5h": return "weekly"
+        default: return "closest"
+        }
+    }
+
+    private func windowTag(_ pace: LanePace) -> some View {
+        Button(action: cyclePin) {
+            Text(pace.windowTag)
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(pinned == "auto" ? HUD.ink3 : HUD.ink2)
+                .padding(.horizontal, 5).padding(.vertical, 1.5)
+                .background(Capsule().fill(Color.white.opacity(pinned == "auto" ? 0 : 0.09)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(pinned == "auto"
+              ? "Showing whichever limit is closer to running out. Click to always show the 5-hour limit."
+              : "Always showing the \(pinned == "5h" ? "5-hour" : "weekly") limit. Click to show the \(nextPinName) limit.")
+    }
+
+    private func cyclePin() {
+        switch pinned {
+        case "auto": pinned = "5h"
+        case "5h": pinned = "wk"
+        default: pinned = "auto"
+        }
+    }
+
+    private func rowHelp(_ pace: LanePace) -> String {
+        let freshness = UsageInsights.laneFreshness(for: snapshot)
+        if freshness.isOld {
+            return "This is the last known reading, not a current estimate of available usage. " +
+                (freshness.issueDetail ?? "Open Help for a health check and recovery steps.")
+        }
+        let window = LaneSpeech.windowName(pace.windowTag)
+        var lines: [String] = []
+        if let e = pace.elapsed {
+            lines.append("The bar shows how much of the \(window) you've used. The tick marks how much of its time has passed (\(formatPercent(e))). Behind the tick means room to spare; past it means you're using it faster than it lasts.")
+        } else {
+            lines.append("The bar shows how much of the \(window) you've used. The reset time isn't known, so there's no tick.")
+        }
+        if pace.status == "ON PACE" { lines.append("On pace: your use is keeping up with the clock, not ahead of it.") }
+        if isPrimary { lines.append("The ringed lane sets the verdict at the top. The daily figure is how much you can use each day and still last until the reset.") }
+        return lines.joined(separator: "\n")
+    }
+}
+
 /// The ping bell as a VoiceOver action on the lane, since the lane row is
 /// one element and its bell button is no longer reachable on its own.
 private struct BellAction: ViewModifier {
@@ -790,7 +1130,7 @@ private struct PingBell: View {
             Image(systemName: on ? "bell.fill" : "bell")
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(on ? HUD.ink : (hovering ? HUD.ink2 : HUD.ink3.opacity(0.7)))
-                .frame(width: 16, height: 16)
+                .frame(width: LaneGrid.bell, height: 16)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1212,7 +1552,14 @@ private func emptyEstimate(used: Double, elapsed: Double, duration: TimeInterval
 
 // MARK: - Daily budget + lanes
 
-private struct TodayRoom { let value: String; let sub: String; let color: Color; var perDay: String? = nil }
+private struct TodayRoom {
+    let value: String
+    let sub: String
+    let color: Color
+    var perDay: String? = nil
+
+    var rowNote: String? { perDay.map { "\($0) a day to last" } }
+}
 
 private func todayRoom(_ snap: UsageSnapshot, now: Date = Date()) -> TodayRoom? {
     guard let room = UsageInsights.dailyRoom(for: snap, now: now) else { return nil }
@@ -1958,42 +2305,31 @@ private struct WeeklyWin: View {
     var body: some View {
         let visible = UsageInsights.visibleProviderOrder(snapshots: state.snapshots, budgets: state.budgets)
         let line = SpendDisplay.valueLine(state.spend, visibleProviders: visible).flatMap { $0.isWin ? $0 : nil }
-        let local = visible.contains("local") ? UsageInsights.snapshot(for: "local", in: state.snapshots)?.session : nil
-        if line != nil || local != nil {
-            VStack(alignment: .leading, spacing: 4) {
-                if let line {
-                    HStack(alignment: .center, spacing: 6) {
-                        if let value = line.value {
-                            (Text(value).font(.system(size: 22, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
-                             + Text(line.paidWeek.map { "  of work for \($0) this week" } ?? "  of work this week")
-                                .font(.system(size: 12.5, weight: .medium)).foregroundStyle(HUD.ink2))
-                                .monospacedDigit()
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.8)
-                        } else {
-                            Text("Reading session logs…").font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.ink3)
-                        }
-                        Spacer(minLength: 0)
-                        if let m = line.multiple, (line.multipleValue ?? 0) >= 2 {
-                            Text(m)
-                                .font(.system(size: 15, weight: .heavy, design: .rounded))
-                                .foregroundStyle(HUD.go)
-                                .padding(.horizontal, 8).padding(.vertical, 2)
-                                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(HUD.go, lineWidth: 1.5))
-                                .rotationEffect(.degrees(-4))
-                        } else if line.showSetPlan {
-                            SetPlanLink()
-                        }
-                    }
-                    .help(line.help)
+        if let line {
+            HStack(alignment: .center, spacing: 6) {
+                if let value = line.value {
+                    (Text(value).font(.system(size: 22, weight: .bold, design: .rounded)).foregroundStyle(HUD.ink)
+                     + Text(line.paidWeek.map { "  of work for \($0) this week" } ?? "  of work this week")
+                        .font(.system(size: 12.5, weight: .medium)).foregroundStyle(HUD.ink2))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                } else {
+                    Text("Reading session logs…").font(.system(size: 11, weight: .medium)).foregroundStyle(HUD.ink3)
                 }
-                if let local {
-                    Text("Local: \(compactTokenCount(local.todayTotal ?? 0)) tokens today, \(compactTokenCount(local.weekTotal ?? 0)) this week")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(HUD.ink3)
-                        .help("Tokens your local models (Ollama) read and wrote, counted from Ollama's logs on this Mac. Local models have no usage limit.")
+                Spacer(minLength: 0)
+                if let m = line.multiple, (line.multipleValue ?? 0) >= 2 {
+                    Text(m)
+                        .font(.system(size: 15, weight: .heavy, design: .rounded))
+                        .foregroundStyle(HUD.go)
+                        .padding(.horizontal, 8).padding(.vertical, 2)
+                        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(HUD.go, lineWidth: 1.5))
+                        .rotationEffect(.degrees(-4))
+                } else if line.showSetPlan {
+                    SetPlanLink()
                 }
             }
+            .help(line.help)
             .padding(.top, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .overlay(alignment: .top) { Rectangle().fill(HUD.hairSoft).frame(height: 0.5) }
@@ -2313,15 +2649,13 @@ private struct EmptyLaneRow: View {
     var onRecover: () -> Void = {}
     var body: some View {
         Button(action: onRecover) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text(UsageInsights.label(for: provider))
-                    .font(.system(size: 13.5, weight: .semibold)).foregroundStyle(HUD.ink2)
-                    .frame(width: 62, alignment: .leading)
+            HStack(alignment: .firstTextBaseline, spacing: LaneGrid.gap) {
+                LaneName(title: laneTitle(provider), dot: HUD.wait)
                 Text(line).font(.system(size: 10.5, weight: .medium)).foregroundStyle(HUD.watch)
                     .underline(true, color: HUD.watch.opacity(0.7)).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 10).padding(.vertical, 8).contentShape(Rectangle())
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain).accessibilityElement(children: .ignore)
         .accessibilityLabel("\(UsageInsights.label(for: provider)), no reading yet. \(line)")
@@ -2357,6 +2691,95 @@ private struct ModeStyle {
         default: return HUD.wait
         }
     }
+    var onColor: Color { raw == "yellow" ? .black : Color(hex: 0x06231A) }
+    var icon: String {
+        switch raw {
+        case "green": return "bolt.fill"
+        case "yellow": return "eye.fill"
+        case "orange": return "exclamationmark.triangle.fill"
+        case "red": return "hand.raised.fill"
+        case "freeze": return "snowflake"
+        case "check": return "questionmark.circle.fill"
+        default: return "clock.fill"
+        }
+    }
+    var word: String {
+        switch raw {
+        case "green": return "GO"
+        case "yellow": return "WATCH"
+        case "orange": return "SLOW"
+        case "red": return "STOP"
+        case "freeze": return "FREEZE"
+        case "check": return "CHECK"
+        default: return "WAIT"
+        }
+    }
+    var spokenWord: String {
+        switch raw {
+        case "green": return "Go"
+        case "yellow": return "Watch"
+        case "orange": return "Slow down"
+        case "red": return "Stop"
+        case "freeze": return "Out until reset"
+        case "check": return "Check"
+        default: return "Waiting"
+        }
+    }
+    var reassure: String {
+        switch raw {
+        case "green": return "This lane has room. The other lanes below have their own numbers."
+        case "yellow": return "You're using this lane faster than its limit lasts. Keep sessions short."
+        case "orange": return "Save this lane for work that matters most."
+        case "red": return "Nearly out. Save what's left for work that can't wait."
+        case "freeze": return "Out until the reset. Use another lane until then."
+        case "check": return "This lane's reading isn't current. Refresh before trusting the verdict."
+        default: return "Waiting for a reading after the reset."
+        }
+    }
+}
+
+private struct Binding {
+    let provider: String
+    let headroom: Double
+    let title: String
+    let resetLabel: String?
+}
+
+private func bindingConstraint(_ snapshots: [UsageSnapshot]) -> Binding? {
+    var worst: (provider: String, used: Double, title: String, reset: String?)?
+    for snap in snapshots {
+        let name = UsageInsights.label(for: snap.provider)
+        let pid = snap.provider.lowercased()
+        if let s = snap.currentSession, let used = s.usedPct {
+            if worst == nil || used > worst!.used {
+                worst = (pid, used, "\(name) \(shortWindowTitle(snap, isSession: true))", s.resetLabel)
+            }
+        }
+        if let w = snap.week, let used = w.usedPct {
+            if worst == nil || used > worst!.used {
+                worst = (pid, used, "\(name) \(shortWindowTitle(snap, isSession: false))", w.resetLabel)
+            }
+        }
+    }
+    guard let worst else { return nil }
+    return Binding(provider: worst.provider, headroom: max(0, 100 - worst.used), title: worst.title, resetLabel: worst.reset)
+}
+
+private func shortWindowTitle(_ snapshot: UsageSnapshot, isSession: Bool) -> String {
+    if isSession { return "5-hour" }
+    return snapshot.provider.lowercased() == "gemini" ? "Quota" : "Weekly"
+}
+
+private func pressWindow(_ snap: UsageSnapshot) -> (headroom: Double, label: String, reset: String?)? {
+    var worst: (used: Double, label: String, reset: String?)?
+    if let s = snap.currentSession, let u = s.usedPct {
+        worst = (u, "5-hour", s.resetLabel)
+    }
+    if let w = snap.week, let u = w.usedPct, worst == nil || u > worst!.used {
+        worst = (u, snap.provider.lowercased() == "gemini" ? "quota" : "weekly", w.resetLabel)
+    }
+    guard let worst else { return nil }
+    return (max(0, 100 - worst.used), worst.label, worst.reset)
 }
 
 /// Lead with Claude (the usual headline lane), then Codex, Gemini, Grok, Local.
@@ -2411,6 +2834,7 @@ private enum HUD {
     static let wait = Color(hex: 0x8A8F98)
 
     static let claude = Color(hex: 0xE07A5B)
+    static let fable = Color(hex: 0xF06A6A)
     static let codex = Color(hex: 0x5FD3C4)
     static let gemini = Color(hex: 0x6F8BF5)
     static let grok = Color(hex: 0xD7DBE2)

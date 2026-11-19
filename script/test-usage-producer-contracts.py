@@ -672,7 +672,7 @@ def test_gemini_agy_probe_reads_both_groups_and_paces_spawns() -> None:
         assert probe["spawnsToday"] == 1 and probe["forcedToday"] == 1 and probe["lastAttemptForced"] is True
 
         # Both daily caps hold even when the spacing has elapsed.
-        probe.update(spawnsToday=48, forcedToday=4, lastAttemptAt="2000-01-01T00:00:00Z")
+        probe.update(spawnsToday=48, forcedToday=16, lastAttemptAt="2000-01-01T00:00:00Z")
         write_json(state / "gemini-agy-probe-state.json", probe)
         snap = json.loads((state / "gemini-usage.json").read_text())
         snap["antigravity"]["capturedAt"] = datetime.fromtimestamp(time.time() - 5 * 3600, timezone.utc).isoformat()
@@ -680,6 +680,15 @@ def test_gemini_agy_probe_reads_both_groups_and_paces_spawns() -> None:
         run_node(ROOT / "bin/bloom-usage-write-gemini-agy", [], env)
         run_node(ROOT / "bin/bloom-usage-write-gemini-agy", ["--force"], env)
         assert len(calls.read_text().splitlines()) == 2, "daily caps must stop the spawn"
+
+        # A cached bucket whose resetTime has passed bypasses the 30-minute spacing once 2m elapsed.
+        probe.update(spawnsToday=1, forcedToday=0, lastAttemptAt=datetime.fromtimestamp(time.time() - 180, timezone.utc).isoformat())
+        write_json(state / "gemini-agy-probe-state.json", probe)
+        snap["antigravity"]["capturedAt"] = datetime.fromtimestamp(time.time() - 60, timezone.utc).isoformat()
+        snap["antigravity"]["quota"]["groups"][0]["buckets"][0]["resetTime"] = datetime.fromtimestamp(time.time() - 30, timezone.utc).isoformat()
+        write_json(state / "gemini-usage.json", snap)
+        run_node(ROOT / "bin/bloom-usage-write-gemini-agy", [], env)
+        assert len(calls.read_text().splitlines()) == 3, "expired reset bucket should trigger refresh past 2m"
 
 
 def test_gemini_agy_probe_schedule_never_goes_stale() -> None:

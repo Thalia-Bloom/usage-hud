@@ -45,12 +45,15 @@ final class QuietFixesTests: XCTestCase {
         XCTAssertTrue(BudgetEvaluator.shouldRewrite(payload(3, stamp: now.addingTimeInterval(61)), at: url, now: now.addingTimeInterval(61)), "stamp over a minute old")
     }
 
-    /// A colored (non-template) gauge must draw its "left" text in the bar's
-    /// own appearance: light on a dark bar, dark on a light bar.
+    /// A colored (non-template) glyph draws its calm bars with the menu bar's
+    /// foreground appearance: light on a dark bar, dark on a light bar.
     @MainActor
     func testMenuBarIconFollowsBarAppearance() throws {
-        let image = UsageStatusIcon.image(left: 38, tone: .hot)
-        XCTAssertFalse(image.isTemplate, "a plan that needs a look adds color, so no template")
+        let image = UsageStatusIcon.image(lanes: [
+            GlyphLane(name: "Claude", usedPct: 35, mode: "green", isConnected: true),
+            GlyphLane(name: "Codex", usedPct: 92, mode: "red", isConnected: true),
+        ])
+        XCTAssertFalse(image.isTemplate, "a lane that needs attention adds color, so no template")
         func calmBarBrightness(_ name: NSAppearance.Name) throws -> Double {
             let scale = 4
             let rep = try XCTUnwrap(NSBitmapImageRep(
@@ -64,9 +67,9 @@ final class QuietFixesTests: XCTestCase {
                 image.draw(in: NSRect(origin: .zero, size: image.size))
             }
             NSGraphicsContext.restoreGraphicsState()
-            // The text's columns, right of the gauge.
-            let barMinX = Int(UsageStatusIcon.gaugeWidth + 5) * scale
-            let barMaxX = rep.pixelsWide
+            // The first bar's columns, left of the red second bar.
+            let barMinX = Int(UsageStatusIcon.sidePad) * scale
+            let barMaxX = Int(UsageStatusIcon.sidePad + UsageStatusIcon.barWidth) * scale
             var total = 0.0, count = 0.0
             for y in 0..<rep.pixelsHigh {
                 for x in barMinX..<barMaxX {
@@ -79,8 +82,8 @@ final class QuietFixesTests: XCTestCase {
         }
         let onDark = try calmBarBrightness(.darkAqua)
         let onLight = try calmBarBrightness(.aqua)
-        XCTAssertGreaterThan(onDark, 0.6, "text should be light on a dark bar")
-        XCTAssertGreaterThanOrEqual(onLight, 0, "text should be drawn")
-        XCTAssertLessThan(onLight, 0.4, "text should be dark on a light bar")
+        XCTAssertGreaterThan(onDark, 0.55, "calm bar should be light on a dark menu bar")
+        XCTAssertGreaterThanOrEqual(onLight, 0, "calm bar should be drawn")
+        XCTAssertLessThan(onLight, 0.45, "calm bar should be dark on a light menu bar")
     }
 }

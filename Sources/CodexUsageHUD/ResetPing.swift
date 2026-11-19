@@ -41,15 +41,18 @@ struct ResetPingTracker: Codable {
                       let reset = UsageInsights.resetDate(for: metric, now: now), reset > now
                 else { continue }
                 let id = "\(snapshot.provider).\(role)"
-                if let watch = watches[id], now >= watch.reset, observed >= watch.reset,
-                   reset > watch.reset, used < 100, !snoozed {
+                if let watch = watches[id],
+                   observed <= now,
+                   (now >= watch.reset && observed >= watch.reset && reset > watch.reset && used < 100)
+                    || (reset.timeIntervalSince(watch.reset) > 3600 && used < 25),
+                   !snoozed {
                     let ping = Ping(id: watch.token, provider: snapshot.provider, label: label, date: now, used: used)
                     pings.append(ping)
                     history.insert(ping, at: 0)
                     completed.append(watch.token)
                     watches.removeValue(forKey: id)
                 }
-                if used >= 100 {
+                if used >= 80 {
                     let watch = Watch(id: id, provider: snapshot.provider, label: label, reset: reset,
                                       exhaustedAt: watches[id]?.exhaustedAt ?? now)
                     if !completed.contains(watch.token) { watches[id] = watch }

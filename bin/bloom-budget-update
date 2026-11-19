@@ -79,7 +79,11 @@ elif [ "${CODEX_USAGE_HUD_MANUAL_REFRESH:-0}" = "1" ]; then
 fi
 
 run_writer "codex-writer" "$NODE_BIN" "$(helper bloom-usage-write-codex)" || true
-run_writer "gemini-writer" "$NODE_BIN" "$(helper bloom-usage-write-gemini-agy)" || true
+if [ "${CODEX_USAGE_HUD_MANUAL_REFRESH:-0}" = "1" ]; then
+  run_writer "gemini-writer" "$NODE_BIN" "$(helper bloom-usage-write-gemini-agy)" --force || true
+else
+  run_writer "gemini-writer" "$NODE_BIN" "$(helper bloom-usage-write-gemini-agy)" || true
+fi
 run_writer "grok-writer" "$NODE_BIN" "$(helper bloom-usage-write-grok)" || true
 
 nohup "$NODE_BIN" "$(helper bloom-budget-notify)" >/dev/null 2>&1 </dev/null &

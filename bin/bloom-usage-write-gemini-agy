@@ -55,7 +55,7 @@ const AGY_BIN = resolveAgyBin();
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAILY_SPAWN_CAP = Math.max(1, numberEnv('BLOOM_AGY_PROBE_DAILY_CAP', 48));
-const FORCED_DAILY_CAP = numberEnv('BLOOM_AGY_PROBE_FORCED_DAILY_CAP', 4);
+const FORCED_DAILY_CAP = numberEnv('BLOOM_AGY_PROBE_FORCED_DAILY_CAP', 16);
 const SPAWN_AFTER_MS = numberEnv('BLOOM_AGY_SPAWN_AFTER_MS', Math.round(24 * HOUR_MS / DAILY_SPAWN_CAP));
 // Past this age the snapshot says stale: one spacing plus 30 minutes for the
 // HUD refresh cadence, so a healthy lane is never stale between reads
@@ -81,11 +81,21 @@ async function main() {
     const checkedAt = new Date(now).toISOString();
     const cached = readCachedQuota();
     const cacheAge = cached ? now - Date.parse(cached.capturedAt) : Infinity;
+    const probeState = readProbeState();
+    const lastAttemptMs = Date.parse(probeState.lastAttemptAt || '');
+    const hasExpiredBucket = Boolean(
+      cached && cached.quota && Array.isArray(cached.quota.groups) &&
+      cached.quota.groups.some((g) => Array.isArray(g.buckets) && g.buckets.some((b) => {
+        const t = Date.parse(b.resetTime || '');
+        return Number.isFinite(t) && t <= now;
+      }))
+    );
+    const expiredRefreshDue = hasExpiredBucket && (!Number.isFinite(lastAttemptMs) || (now - lastAttemptMs >= 2 * 60 * 1000));
 
     // Called at statusline frequency: with a recent quota on disk, do nothing.
-    if (!FORCE && cacheAge < MIN_REFRESH_MS) return;
+    if (!FORCE && !expiredRefreshDue && cacheAge < MIN_REFRESH_MS) return;
 
-    if (!FORCE && cacheAge < SPAWN_AFTER_MS) {
+    if (!FORCE && !expiredRefreshDue && cacheAge < SPAWN_AFTER_MS) {
       // Cached data keeps the quota's own capture stamp — restamping to now
       // would launder its age past codex-usage-doctor's freshness check.
       writeSnapshot(cached.quota, cached.capturedAt, cached.capturedAt, {
@@ -104,7 +114,7 @@ async function main() {
       // Absent tool: no spawn attempt, no failure counter, no daily spawn spent.
       blocked = 'agy is not installed';
     } else {
-      const gate = spawnGate(readProbeState(), now, FORCE);
+      const gate = spawnGate(probeState, now, FORCE, expiredRefreshDue);
       if (!gate.allowed) {
         blocked = gate.reason;
       } else {
@@ -180,7 +190,7 @@ function writeFailureStatus(status, message) {
 
 // ---- spawn gate -----------------------------------------------------------
 
-function spawnGate(state, now, force) {
+function spawnGate(state, now, force, bypassSpacing = false) {
   const today = localDate(new Date(now));
   if (force) {
     const forcedToday = state.day === today ? integer(state.forcedToday, 0) : 0;
@@ -196,7 +206,7 @@ function spawnGate(state, now, force) {
   const lastAttempt = Date.parse(state.lastAttemptAt || '');
   if (Number.isFinite(lastAttempt)) {
     const failures = Math.max(0, integer(state.consecutiveFailures, 0));
-    const wait = failures > 0 ? backoffMs(failures) : SPAWN_AFTER_MS;
+    const wait = failures > 0 ? backoffMs(failures) : (bypassSpacing ? 2 * 60 * 1000 : SPAWN_AFTER_MS);
     if (now - lastAttempt < wait) {
       const nextAt = new Date(lastAttempt + wait).toISOString();
       return {
